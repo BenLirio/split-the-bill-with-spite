@@ -889,7 +889,12 @@ async function startVoice() {
   };
   mediaRecorder.onstop = async () => {
     if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
-    const blobType = (mediaRecorder && mediaRecorder.mimeType) || mimeType || 'audio/webm';
+    const rawType = (mediaRecorder && mediaRecorder.mimeType) || mimeType || 'audio/webm';
+    // Safari's MediaRecorder reports mimeType with codec parameters
+    // (e.g. "audio/mp4;codecs=mp4a.40.2"). Strip them so the resulting
+    // data URL is "data:audio/mp4;base64,..." — the server's parser
+    // accepts parameters now, but keeping the URL clean is simpler.
+    const blobType = rawType.split(';')[0].trim() || 'audio/webm';
     const blob = new Blob(voiceChunks, { type: blobType });
     voiceChunks = [];
     cleanupStream();
@@ -984,6 +989,7 @@ function speechErrorCopy(status, code) {
   if (status === 429) return 'too many requests \u2014 wait a minute, then try again';
   if (code === 'audio_too_large') return 'that ran long \u2014 keep it under 45 seconds';
   if (code === 'audio_too_small') return 'didn\u2019t catch that \u2014 try again';
+  if (code === 'bad_audio' || code === 'bad_audio_type') return 'couldn\u2019t read that recording \u2014 try again or type';
   return 'transcription failed \u2014 try again or type';
 }
 
