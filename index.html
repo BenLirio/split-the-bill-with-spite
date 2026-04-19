@@ -33,11 +33,11 @@
           <input id="bill-total" name="bill-total" type="text" inputmode="decimal" value="184.00" maxlength="8" autocomplete="off" spellcheck="false">
         </div>
         <div class="scan-row">
-          <button type="button" id="scan-btn" class="scan-btn" aria-label="snap a photo of the receipt to fill in the total">
+          <label for="scan-input" id="scan-btn" class="scan-btn" aria-label="snap a photo of the receipt to fill in the total">
             <span class="scan-icon" aria-hidden="true"></span>
             <span class="scan-label">Snap a photo of the receipt</span>
-          </button>
-          <input id="scan-input" class="visually-hidden" type="file" accept="image/*" capture="environment">
+            <input id="scan-input" class="visually-hidden" type="file" accept="image/*" capture="environment" tabindex="-1">
+          </label>
         </div>
         <p id="scan-status" class="scan-status" aria-live="polite"></p>
 
