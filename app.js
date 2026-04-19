@@ -20,6 +20,10 @@ const SLUG = 'split-the-bill-with-spite';
 const MIN_PEOPLE = 3;
 const MAX_PEOPLE = 6;
 
+// In-memory photo of the tab (data URL). Client-side only — never uploaded.
+// Intentionally not encoded into the share URL fragment (would blow up link size).
+let tabPhotoDataUrl = null;
+
 // ---------- util ----------
 
 function hash(str) {
@@ -483,6 +487,19 @@ function renderReceipt(receipt) {
   $('receipt-id').textContent = receipt.receipt_id;
   $('foot-id').textContent = `${receipt.receipt_id} · filed ${receipt.date}`;
 
+  // Attach the tab photo as "Exhibit A" if the user supplied one this session.
+  const exhibitEl = $('exhibit');
+  const exhibitImg = $('exhibit-img');
+  if (exhibitEl && exhibitImg) {
+    if (tabPhotoDataUrl) {
+      exhibitImg.src = tabPhotoDataUrl;
+      exhibitEl.classList.remove('hidden');
+    } else {
+      exhibitImg.removeAttribute('src');
+      exhibitEl.classList.add('hidden');
+    }
+  }
+
   const container = $('people');
   container.innerHTML = '';
   receipt.people.forEach(p => {
@@ -580,6 +597,8 @@ function onReset() {
   history.replaceState(null, '', location.pathname + location.search);
   $('log').value = '';
   $('bill-total').value = '184.00';
+  clearTabPhoto();
+  stopVoice();
   updateLineCount();
   $('intake-error').classList.add('hidden');
   showScreen('intake');
@@ -600,6 +619,302 @@ function onSample() {
   $('bill-total').value = '184.00';
   updateLineCount();
   $('intake-error').classList.add('hidden');
+}
+
+// ---------- tab photo intake (Exhibit A) ----------
+//
+// Client-side only: read the File, downscale to ~1200px long edge, store as a
+// JPEG data URL for both the intake preview and the receipt's Exhibit A card.
+// Never uploaded — the server only ever sees text.
+
+const MAX_EXHIBIT_EDGE = 1200;
+const EXHIBIT_JPEG_QUALITY = 0.82;
+
+function readImageFileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('read_failed'));
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(file);
+  });
+}
+
+function downscaleImage(srcDataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onerror = () => resolve(srcDataUrl); // fall back to original
+    img.onload = () => {
+      try {
+        const w = img.naturalWidth;
+        const h = img.naturalHeight;
+        if (!w || !h) return resolve(srcDataUrl);
+        const longEdge = Math.max(w, h);
+        const scale = longEdge > MAX_EXHIBIT_EDGE ? (MAX_EXHIBIT_EDGE / longEdge) : 1;
+        const tw = Math.round(w * scale);
+        const th = Math.round(h * scale);
+        const canvas = document.createElement('canvas');
+        canvas.width = tw;
+        canvas.height = th;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, tw, th);
+        const out = canvas.toDataURL('image/jpeg', EXHIBIT_JPEG_QUALITY);
+        resolve(out);
+      } catch (_) {
+        resolve(srcDataUrl);
+      }
+    };
+    img.src = srcDataUrl;
+  });
+}
+
+async function onTabPhotoChange(e) {
+  const input = e.target;
+  const file = input && input.files && input.files[0];
+  if (!file) return;
+  if (!/^image\//.test(file.type)) {
+    input.value = '';
+    return;
+  }
+  try {
+    const raw = await readImageFileToDataUrl(file);
+    const scaled = await downscaleImage(raw);
+    tabPhotoDataUrl = scaled;
+    showTabPhotoPreview(scaled);
+  } catch (_) {
+    clearTabPhoto();
+  }
+  // Reset the input so the same file can be chosen again after clearing.
+  input.value = '';
+}
+
+function showTabPhotoPreview(dataUrl) {
+  const drop = $('exhibit-drop');
+  const inner = $('exhibit-inner');
+  const preview = $('exhibit-preview');
+  const clear = $('exhibit-clear');
+  if (!drop || !preview || !clear) return;
+  preview.src = dataUrl;
+  preview.classList.remove('hidden');
+  clear.classList.remove('hidden');
+  if (inner) inner.classList.add('hidden');
+  drop.classList.add('has-photo');
+}
+
+function clearTabPhoto() {
+  tabPhotoDataUrl = null;
+  const drop = $('exhibit-drop');
+  const inner = $('exhibit-inner');
+  const preview = $('exhibit-preview');
+  const clear = $('exhibit-clear');
+  if (preview) {
+    preview.classList.add('hidden');
+    preview.removeAttribute('src');
+  }
+  if (clear) clear.classList.add('hidden');
+  if (inner) inner.classList.remove('hidden');
+  if (drop) drop.classList.remove('has-photo');
+  const input = $('tab-photo');
+  if (input) input.value = '';
+}
+
+function onExhibitClearClick(e) {
+  // The file input is inside the label, so a click on the "x" would also open
+  // the picker. Swallow it.
+  e.preventDefault();
+  e.stopPropagation();
+  clearTabPhoto();
+}
+
+// ---------- voice intake (Web Speech API) ----------
+//
+// Press-and-hold (or tap-to-toggle) the mic button to dictate. Transcription
+// streams into the textarea. Each utterance pause writes a new line so the
+// "one person per line" intake rule still lines up. Completely optional; the
+// text path always works. No backend calls — the browser handles recognition
+// locally (or via the platform's speech service on Chrome/Edge).
+
+const SpeechRec = (typeof window !== 'undefined') &&
+  (window.SpeechRecognition || window.webkitSpeechRecognition);
+
+let voice = null;          // active SpeechRecognition instance
+let voiceActive = false;
+let voicePressedAt = 0;    // for distinguishing tap vs hold
+let voiceAppendBase = '';  // textarea value when the current session started
+let voiceFinalChunks = []; // finalized transcript chunks for this session
+
+function setMicStatus(text, cls) {
+  const el = $('mic-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.remove('active', 'error');
+  if (cls) el.classList.add(cls);
+}
+
+function normalizeUtterance(s) {
+  // Convert common spoken punctuation to symbols, drop trailing "period".
+  let out = String(s || '').trim();
+  if (!out) return out;
+  out = out
+    .replace(/\s+(new line|newline)\s*/gi, '\n')
+    .replace(/\s+period\.?$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Lowercase sentence-initial words; speech APIs tend to over-capitalize.
+  // Leave names (first word) as-is so capitalization feels natural.
+  return out;
+}
+
+function buildVoiceTextarea(interim) {
+  const finals = voiceFinalChunks.map(normalizeUtterance).filter(Boolean);
+  const parts = [voiceAppendBase.replace(/\s+$/, '')];
+  if (finals.length) {
+    // Separate finals from base and each other with newlines — each utterance
+    // is assumed to be one diner.
+    const joined = finals.join('\n');
+    parts.push(joined);
+  }
+  let text = parts.filter(Boolean).join('\n');
+  if (interim) {
+    text = (text ? text + '\n' : '') + normalizeUtterance(interim);
+  }
+  return text;
+}
+
+function writeVoiceToTextarea(interim) {
+  const ta = $('log');
+  if (!ta) return;
+  ta.value = buildVoiceTextarea(interim);
+  updateLineCount();
+}
+
+function startVoice() {
+  if (!SpeechRec) {
+    setMicStatus('this browser can\u2019t listen \u2014 type it instead', 'error');
+    return;
+  }
+  if (voiceActive) return;
+  try {
+    voice = new SpeechRec();
+  } catch (_) {
+    setMicStatus('mic unavailable \u2014 type it instead', 'error');
+    return;
+  }
+  voice.continuous = true;
+  voice.interimResults = true;
+  voice.lang = (navigator.language && navigator.language.startsWith('en')) ? navigator.language : 'en-US';
+  voice.maxAlternatives = 1;
+
+  const ta = $('log');
+  voiceAppendBase = (ta && ta.value) ? (ta.value.replace(/\s+$/, '') + (ta.value.trim() ? '\n' : '')) : '';
+  voiceFinalChunks = [];
+
+  voice.onstart = () => {
+    voiceActive = true;
+    const micBtn = $('mic-btn');
+    if (micBtn) {
+      micBtn.setAttribute('aria-pressed', 'true');
+      const lbl = micBtn.querySelector('.mic-label');
+      if (lbl) lbl.textContent = 'listening\u2026 tap to stop';
+    }
+    setMicStatus('listening\u2026 one person, then pause, then the next', 'active');
+  };
+
+  voice.onresult = (ev) => {
+    let interim = '';
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const r = ev.results[i];
+      const txt = r[0] && r[0].transcript ? r[0].transcript : '';
+      if (r.isFinal) {
+        if (txt.trim()) voiceFinalChunks.push(txt.trim());
+      } else {
+        interim += txt;
+      }
+    }
+    writeVoiceToTextarea(interim);
+  };
+
+  voice.onerror = (ev) => {
+    const err = (ev && ev.error) || 'error';
+    let msg = 'mic error \u2014 type it instead';
+    if (err === 'not-allowed' || err === 'service-not-allowed') msg = 'mic blocked by the browser \u2014 allow it or type';
+    else if (err === 'no-speech') msg = 'didn\u2019t catch that \u2014 try again';
+    else if (err === 'audio-capture') msg = 'no mic detected \u2014 type it instead';
+    setMicStatus(msg, 'error');
+  };
+
+  voice.onend = () => {
+    voiceActive = false;
+    const micBtn = $('mic-btn');
+    if (micBtn) {
+      micBtn.setAttribute('aria-pressed', 'false');
+      const lbl = micBtn.querySelector('.mic-label');
+      if (lbl) lbl.textContent = 'hold to testify';
+    }
+    // Finalize: write with no interim so the textarea ends clean.
+    writeVoiceToTextarea('');
+    if (!voiceFinalChunks.length) {
+      // Leave any existing error message; otherwise clear.
+      const el = $('mic-status');
+      if (el && !el.classList.contains('error')) setMicStatus('');
+    } else {
+      setMicStatus('filed ' + voiceFinalChunks.length + ' line' + (voiceFinalChunks.length === 1 ? '' : 's') + ' into the record', '');
+    }
+    voice = null;
+  };
+
+  try { voice.start(); } catch (_) { /* onend will fire */ }
+}
+
+function stopVoice() {
+  if (!voiceActive || !voice) return;
+  try { voice.stop(); } catch (_) {}
+}
+
+function toggleVoice() {
+  if (voiceActive) stopVoice(); else startVoice();
+}
+
+// Press-and-hold on mobile/desktop: starts on pointerdown, stops on pointerup.
+// Also supports a quick tap to toggle (so mobile users don't have to keep
+// their thumb on it for a whole paragraph).
+function wireMic() {
+  const btn = $('mic-btn');
+  if (!btn) return;
+  if (!SpeechRec) {
+    btn.disabled = true;
+    const lbl = btn.querySelector('.mic-label');
+    if (lbl) lbl.textContent = 'voice unavailable';
+    setMicStatus('voice input needs Chrome, Edge, or Safari', '');
+    return;
+  }
+
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    voicePressedAt = Date.now();
+    if (!voiceActive) startVoice();
+  });
+  btn.addEventListener('pointerup', (e) => {
+    e.preventDefault();
+    const held = Date.now() - voicePressedAt;
+    // If it was a tap (<300ms), keep listening until the user taps again.
+    // If it was a hold, stop on release.
+    if (held >= 300) stopVoice();
+  });
+  btn.addEventListener('pointerleave', () => {
+    const held = Date.now() - voicePressedAt;
+    if (held >= 300) stopVoice();
+  });
+  btn.addEventListener('click', (e) => {
+    // Handled by pointerdown/up; prevent default to avoid double-toggle on
+    // devices that synthesize a click after touch.
+    e.preventDefault();
+  });
+  btn.addEventListener('keydown', (e) => {
+    if (e.key === ' ' || e.key === 'Enter') {
+      e.preventDefault();
+      toggleVoice();
+    }
+  });
 }
 
 // Share: prefer navigator.share (URL contains fragment); fall back to clipboard.
@@ -640,9 +955,27 @@ document.addEventListener('DOMContentLoaded', () => {
     onReset();
   });
 
+  // Exhibit A — photo of the tab.
+  const photoInput = $('tab-photo');
+  if (photoInput) photoInput.addEventListener('change', onTabPhotoChange);
+  const exhibitClear = $('exhibit-clear');
+  if (exhibitClear) {
+    // Button is inside the <label for="tab-photo">; prevent the label from
+    // also forwarding a click to the hidden file input.
+    exhibitClear.addEventListener('click', onExhibitClearClick);
+    exhibitClear.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
+    exhibitClear.addEventListener('mousedown', (e) => { e.stopPropagation(); });
+  }
+
+  // Voice testimony — Web Speech API (client-side, no backend).
+  wireMic();
+
   // Deep-link replay: render from fragment without any re-compute / LLM call.
   const frag = decodeFragment();
   if (frag) {
+    // Shared links do NOT carry the photo (too big for a URL fragment). Hide
+    // the exhibit slot for the shared view so it doesn't render empty.
+    tabPhotoDataUrl = null;
     const receipt = receiptFromFragment(frag);
     renderReceipt(receipt);
   }

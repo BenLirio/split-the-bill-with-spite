@@ -27,15 +27,41 @@
       </header>
 
       <form id="intake-form" autocomplete="off" novalidate>
+        <label class="field-label">Exhibit A <span class="field-sub">the actual tab (optional)</span></label>
+        <div class="exhibit-row">
+          <label for="tab-photo" class="exhibit-drop" id="exhibit-drop">
+            <div class="exhibit-inner" id="exhibit-inner">
+              <div class="exhibit-icon" aria-hidden="true">&#128248;</div>
+              <div class="exhibit-copy">
+                <strong>snap the receipt</strong>
+                <span>photo lands on the verdict as evidence</span>
+              </div>
+            </div>
+            <img id="exhibit-preview" class="exhibit-preview hidden" alt="submitted receipt">
+            <button type="button" id="exhibit-clear" class="exhibit-clear hidden" aria-label="remove photo">&times;</button>
+          </label>
+          <input id="tab-photo" type="file" accept="image/*" capture="environment" class="visually-hidden">
+        </div>
+
         <label for="bill-total" class="field-label">Bill total (USD)</label>
         <div class="amount-row">
           <span class="dollar">$</span>
           <input id="bill-total" name="bill-total" type="text" inputmode="decimal" value="184.00" maxlength="8" autocomplete="off" spellcheck="false">
         </div>
 
-        <label for="log" class="field-label">One person per line &mdash; name, then what they did.</label>
-        <textarea id="log" rows="8" maxlength="1600" spellcheck="false"
-          placeholder="Ben ordered the lobster and a second lobster&#10;Sarah forgot her wallet. again.&#10;Kai talked about crypto for 40 minutes&#10;Priya ordered water and judged everyone&#10;Marcus split an appetizer and called it dinner"></textarea>
+        <label for="log" class="field-label">
+          One person per line &mdash; name, then what they did.
+          <span class="field-sub">talk it out, or type it in</span>
+        </label>
+        <div class="log-wrap">
+          <textarea id="log" rows="8" maxlength="1600" spellcheck="false"
+            placeholder="Ben ordered the lobster and a second lobster&#10;Sarah forgot her wallet. again.&#10;Kai talked about crypto for 40 minutes&#10;Priya ordered water and judged everyone&#10;Marcus split an appetizer and called it dinner"></textarea>
+          <button type="button" id="mic-btn" class="mic-btn" aria-label="record your testimony" aria-pressed="false">
+            <span class="mic-dot" aria-hidden="true"></span>
+            <span class="mic-label">hold to testify</span>
+          </button>
+        </div>
+        <p id="mic-status" class="mic-status" aria-live="polite"></p>
         <div class="meta-row">
           <span id="line-count" class="line-count">0 / 6 people</span>
           <button type="button" id="sample-btn" class="ghost-btn">use a sample</button>
@@ -44,7 +70,7 @@
         <p id="intake-error" class="error hidden" aria-live="polite"></p>
 
         <button id="submit-btn" type="submit" class="primary-btn">Run the numbers</button>
-        <p class="disclaimer">This is not a real bill splitter. Do not settle actual debts with this.</p>
+        <p class="disclaimer">This is not a real bill splitter. Do not settle actual debts with this. Photos and voice never leave your device.</p>
       </form>
     </section>
 
@@ -75,6 +101,11 @@
             <span id="receipt-id">&mdash;</span>
           </p>
         </header>
+
+        <figure id="exhibit" class="exhibit-figure hidden">
+          <img id="exhibit-img" alt="Exhibit A — the original tab">
+          <figcaption>Exhibit A &mdash; filed into the record</figcaption>
+        </figure>
 
         <section id="people" class="people"></section>
 
