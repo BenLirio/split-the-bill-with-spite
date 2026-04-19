@@ -11,9 +11,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css">
-  <script src="app.js" defer></script>
-  <script src="feedback.js" defer></script>
+  <link rel="stylesheet" href="style.css?v=3">
+  <script src="app.js?v=3" defer></script>
+  <script src="feedback.js?v=3" defer></script>
 </head>
 <body>
   <main id="app">
@@ -33,11 +33,11 @@
           <input id="bill-total" name="bill-total" type="text" inputmode="decimal" value="184.00" maxlength="8" autocomplete="off" spellcheck="false">
         </div>
         <div class="scan-row">
-          <label for="scan-input" id="scan-btn" class="scan-btn" aria-label="snap a photo of the receipt to fill in the total">
+          <div id="scan-btn" class="scan-btn" aria-hidden="true">
             <span class="scan-icon" aria-hidden="true"></span>
             <span class="scan-label">Snap a photo of the receipt</span>
-            <input id="scan-input" class="visually-hidden" type="file" accept="image/*" capture="environment" tabindex="-1">
-          </label>
+          </div>
+          <input id="scan-input" class="scan-input" type="file" accept="image/*" capture="environment" aria-label="snap a photo of the receipt to fill in the total">
         </div>
         <p id="scan-status" class="scan-status" aria-live="polite"></p>
 

@@ -1085,16 +1085,17 @@ function setScanStatus(text, cls) {
 function setScanButtonState(state) {
   const btn = $('scan-btn');
   if (!btn) return;
+  const row = btn.parentElement;
   const lbl = btn.querySelector('.scan-label');
   const input = $('scan-input');
   btn.classList.remove('loading');
+  if (row) row.classList.remove('loading');
   if (state === 'loading') {
     btn.classList.add('loading');
-    btn.setAttribute('aria-disabled', 'true');
+    if (row) row.classList.add('loading');
     if (input) input.disabled = true;
     if (lbl) lbl.textContent = 'reading\u2026';
   } else {
-    btn.removeAttribute('aria-disabled');
     if (input) input.disabled = false;
     if (lbl) lbl.textContent = 'Snap a photo of the receipt';
   }
@@ -1175,13 +1176,11 @@ function visionErrorCopy(status, code) {
 }
 
 function wireReceiptScan() {
-  const btn = $('scan-btn');
   const input = $('scan-input');
-  if (!btn || !input) return;
-  // The scan button is a <label for="scan-input">, so tapping it natively opens
-  // the file picker (no JS click() dispatch needed). This sidesteps the iOS
-  // Safari bug where programmatic input.click() on a visually-hidden input
-  // silently fails. We only wire up the change handler to process the file.
+  if (!input) return;
+  // The input is layered transparently on top of .scan-btn, so taps land
+  // on it directly — no label forwarding, no programmatic .click(). This
+  // is the only scan-button pattern that's reliable across iOS Safari.
   input.addEventListener('change', () => {
     const file = input.files && input.files[0];
     onReceiptFile(file);
