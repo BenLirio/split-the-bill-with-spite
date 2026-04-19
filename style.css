@@ -7,7 +7,7 @@
   --card: #ffffff;
   --ink: #111114;
   --ink-2: #3b3c42;
-  --ink-3: #6b6d75;
+  --ink-3: #5a5c64;
   --rule: #e7e5df;
   --rule-strong: #111114;
   --accent: #ff4d2e;
@@ -116,44 +116,60 @@ body {
   border: 0;
 }
 
-.scan-btn {
-  align-self: center;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px 6px 8px;
-  border: 1px solid var(--ink);
-  border-radius: 999px;
-  background: #fff;
-  color: var(--ink);
-  font: 600 11px/1 'Space Grotesk', sans-serif;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  cursor: pointer;
-  min-height: 30px;
-  box-shadow: 0 1px 2px rgba(17, 17, 20, 0.06);
-  transition: background 120ms ease, color 120ms ease, transform 80ms ease;
-  white-space: nowrap;
+.scan-row {
+  margin-top: 10px;
 }
-.scan-btn:hover { background: var(--ink); color: #fff; }
+
+.scan-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 16px;
+  border: 1.5px dashed var(--ink);
+  border-radius: 12px;
+  background: #fafaf7;
+  color: var(--ink);
+  font: 600 14px/1.1 'Space Grotesk', sans-serif;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  min-height: 48px;
+  box-shadow: 0 1px 2px rgba(17, 17, 20, 0.04);
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, transform 80ms ease;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: rgba(255, 77, 46, 0.15);
+  touch-action: manipulation;
+}
+.scan-btn:hover {
+  background: var(--ink);
+  color: #fff;
+  border-color: var(--ink);
+  border-style: solid;
+}
 .scan-btn:active { transform: translateY(1px); }
 .scan-btn[disabled] { opacity: .6; cursor: not-allowed; }
-.scan-btn.loading { background: var(--accent); color: #fff; border-color: var(--accent); }
+.scan-btn.loading {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  border-style: solid;
+}
 
 .scan-icon {
   display: inline-block;
-  width: 12px; height: 10px;
-  border: 1.5px solid currentColor;
-  border-radius: 2px;
+  width: 18px; height: 14px;
+  border: 2px solid currentColor;
+  border-radius: 3px;
   position: relative;
   flex: 0 0 auto;
 }
 .scan-icon::before {
   content: "";
   position: absolute;
-  top: -4px; left: 3px;
-  width: 6px; height: 3px;
-  border: 1.5px solid currentColor;
+  top: -5px; left: 5px;
+  width: 8px; height: 4px;
+  border: 2px solid currentColor;
   border-bottom: 0;
   border-radius: 2px 2px 0 0;
   background: inherit;
@@ -161,8 +177,8 @@ body {
 .scan-icon::after {
   content: "";
   position: absolute;
-  top: 1.5px; left: 3px;
-  width: 3px; height: 3px;
+  top: 3px; left: 5px;
+  width: 4px; height: 4px;
   border-radius: 999px;
   background: currentColor;
 }
@@ -216,7 +232,7 @@ body {
   border-color: var(--ink);
   background: #ffffff;
 }
-#log::placeholder { color: #a7a6a0; }
+#log::placeholder { color: #8a8b85; }
 
 .meta-row {
   display: flex;

@@ -1169,10 +1169,27 @@ function wireReceiptScan() {
   const btn = $('scan-btn');
   const input = $('scan-input');
   if (!btn || !input) return;
-  btn.addEventListener('click', (e) => {
-    e.preventDefault();
-    input.value = '';
-    input.click();
+  // Some browsers (esp. mobile Safari) only open the file picker when the
+  // click is initiated from a trusted user gesture. Keep the handler minimal
+  // and synchronous, and guard against the picker silently failing.
+  const openPicker = (e) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    try {
+      input.value = '';
+      input.click();
+    } catch (_) {
+      setScanStatus('couldn\u2019t open the camera \u2014 enter the total manually', 'error');
+    }
+  };
+  btn.addEventListener('click', openPicker);
+  // Fallback for older mobile browsers where `click` on a styled button can be
+  // flaky — also fire on pointerup / touchend for redundancy. The try/catch
+  // above makes this idempotent.
+  btn.addEventListener('keydown', (e) => {
+    if (e.key === ' ' || e.key === 'Enter') openPicker(e);
   });
   input.addEventListener('change', () => {
     const file = input.files && input.files[0];

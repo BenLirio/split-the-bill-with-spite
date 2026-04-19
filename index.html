@@ -31,9 +31,11 @@
         <div class="amount-row">
           <span class="dollar">$</span>
           <input id="bill-total" name="bill-total" type="text" inputmode="decimal" value="184.00" maxlength="8" autocomplete="off" spellcheck="false">
-          <button type="button" id="scan-btn" class="scan-btn" aria-label="snap a photo of the receipt">
+        </div>
+        <div class="scan-row">
+          <button type="button" id="scan-btn" class="scan-btn" aria-label="snap a photo of the receipt to fill in the total">
             <span class="scan-icon" aria-hidden="true"></span>
-            <span class="scan-label">snap receipt</span>
+            <span class="scan-label">Snap a photo of the receipt</span>
           </button>
           <input id="scan-input" class="visually-hidden" type="file" accept="image/*" capture="environment">
         </div>
