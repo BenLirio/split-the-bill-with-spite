@@ -1,28 +1,42 @@
-// Split the Bill With Spite — enter the actual receipt total + what each diner did;
+// Split the Bill With Spite — enter the actual receipt total + what everyone did;
 // return a spite-adjusted itemized receipt. Per-person amounts SUM to the stated
 // bill — spite just redistributes who pays more and who pays less.
 //
-// Design decisions (per KB + feedback triage):
-//   - One textarea, but parsing is smart: accepts either (a) one person per line
-//     OR (b) multiple people in one run-on paragraph. A name-detector splits
-//     run-on text into per-person records.
-//   - Deterministic core logic (verdict picks, spite weights, totals) — seeded
-//     off a hash of the input so the same paste always yields the same receipt.
-//   - TOTAL-PRESERVING: the per-person amounts always sum to the stated bill.
-//     Spite multipliers bias a weighted split — they don't tack on a surplus.
-//   - Optional LLM flourish per person (one snappy quoted line-item quip).
-//     Temperature 0, response_format=json_object. Deterministic fallback if the
-//     call fails, times out, or returns garbage.
-//   - Final state is encoded into location.hash so a shared link re-renders the
-//     exact same receipt without any LLM call or recompute.
-//   - Mobile-first, modern Venmo/Splitwise aesthetic.
+// Design (post-reshape):
+//   - AI-first diner identification. The user writes one free-form paragraph
+//     or messy voice dictation; the LLM decides who the diners are, what they
+//     did, picks a verdict archetype per person, and writes the line-item
+//     quip. No client-side name regex. No verdict keyword table on the hot
+//     path (it still exists as a last-ditch fallback if the LLM call fails).
+//   - No person cap. The app accepts any number of diners from 2 up — the
+//     pettiness scales with whatever the model finds in the text.
+//   - Deterministic core money math. Once we have the list of
+//     {name, behavior, verdict} records, we compute weights + cents in JS so
+//     totals always sum exactly to the stated bill.
+//   - TOTAL-PRESERVING: per-person amounts always sum to the stated bill.
+//     Spite multipliers bias a weighted split — they don't tack on surplus.
+//   - Final state is encoded into location.hash so a shared link re-renders
+//     the same receipt without any LLM call or recompute.
+//   - Receipt photo intake uses the vision proxy's FAST tier (gemini-2.5-flash)
+//     — pulling a grand total off a receipt doesn't need the pro model, and
+//     speed matters more than edge-case accuracy at the intake step.
+//   - After a successful scan the photo button collapses to a compact
+//     confirmation chip — no lingering "snap a photo" affordance once the
+//     total is already filled in.
 
 const AI_ENDPOINT = 'https://uy3l6suz07.execute-api.us-east-1.amazonaws.com/ai';
 const SPEECH_ENDPOINT = 'https://hwfpnikys5.execute-api.us-east-1.amazonaws.com/speech';
 const VISION_ENDPOINT = 'https://sm3y7y9t2a.execute-api.us-east-1.amazonaws.com/vision';
 const SLUG = 'split-the-bill-with-spite';
-const MIN_PEOPLE = 3;
-const MAX_PEOPLE = 6;
+
+// No upper cap — we'll accept however many diners the LLM can pull out of
+// the log. A floor of 2 keeps the math meaningful (one person splitting with
+// themselves is not a bill).
+const MIN_PEOPLE = 2;
+// Soft guard — if somehow the LLM (or fallback) returns more than this many,
+// we truncate. Big enough that no real dinner hits it; small enough to keep
+// the receipt readable and the fragment URL short.
+const HARD_MAX_PEOPLE = 40;
 
 // Upper-bound recording length so the audio blob never nears the 5MB/60s proxy cap.
 const MAX_RECORDING_MS = 45000;
@@ -68,12 +82,6 @@ function receiptIdFromSeed(seed) {
   return 'RCPT-' + String(seed % 1000000).padStart(6, '0');
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[c]));
-}
-
 // base64url of JSON (URL-safe, no padding) — used for fragment state.
 function b64urlEncode(obj) {
   const bytes = new TextEncoder().encode(JSON.stringify(obj));
@@ -92,382 +100,103 @@ function b64urlDecode(s) {
   } catch (_) { return null; }
 }
 
-// ---------- verdict catalog ----------
+// ---------- verdict catalog (fallback only) ----------
 //
-// Every verdict is a self-contained archetype label + a spite multiplier in
-// [min, max] relative to their fair share. Positive values skew them toward
-// paying MORE of the bill; negative values toward paying less. Totals always
-// sum to the stated bill — multipliers are applied to a weighted split, not
-// added on top. Deterministic pick by keyword match against their description,
-// then seeded fallback.
+// Used only when the LLM call fails AND the local extractor has pulled out
+// diners by crude heuristic. Each entry is an archetype label + a spite
+// multiplier range in [min, max] relative to their fair share. Positive
+// values skew them toward paying MORE; negative toward paying less. Kept
+// small — no tag-matching on the hot path anymore.
 
-const VERDICTS = [
-  { name: 'The Lobster Heiress',          mult: [0.25, 0.55],  tags: ['lobster','steak','ribeye','wagyu','oyster','truffle','caviar','tasting menu','market price'] },
-  { name: 'The Unpaid Narrator',          mult: [0.20, 0.50],  tags: ['wallet','forgot','left','card','venmo','cash','ill pay you back','ill get you next'] },
-  { name: 'The Calendar Saboteur',        mult: [0.10, 0.25],  tags: ['late','30 min','40 min','traffic','uber','running','running late','showed up at'] },
-  { name: 'The Crypto Homily Giver',      mult: [0.15, 0.30],  tags: ['crypto','bitcoin','btc','eth','ethereum','nft','blockchain','web3','solana','doge','token'] },
-  { name: 'The Side-Eye Ascetic',         mult: [-0.20, -0.05], tags: ['water','just water','tap','salad','side salad','didnt eat','not hungry','didnt drink','nothing','just the'] },
-  { name: 'The Sommelier Volunteer',      mult: [0.20, 0.45],  tags: ['wine','bottle','second bottle','pinot','chardonnay','cab','cabernet','somm','pairings','pairing','natural wine','glass of','old fashioned','whiskey','neat','cocktail','espresso martini','martini'] },
-  { name: 'The Appetizer Opportunist',    mult: [0.05, 0.15],  tags: ['appetizer','app','picked at','shared','everyones fries','split the','nibbled','stole a'] },
-  { name: 'The Birthday Freeloader',      mult: [-0.10, 0.05], tags: ['birthday','its my birthday','bday','turning'] },
-  { name: 'The Dietary Restrictor',       mult: [-0.05, 0.10], tags: ['gluten','vegan','vegetarian','allergy','allergic','lactose','keto','paleo','intolerant','sub the'] },
-  { name: 'The Substitution Surgeon',     mult: [0.05, 0.15],  tags: ['sub','substitute','no onion','no cheese','on the side','dressing on','well done','extra','hold the','swap','modify','modification'] },
-  { name: 'The Reservation Dictator',     mult: [0.05, 0.15],  tags: ['reservation','picked','chose','i picked','i chose','my idea','this place','booked'] },
-  { name: 'The Split Evangelist',         mult: [-0.05, 0.10], tags: ['split it evenly','even split','split evenly','split the bill','just split','divide it','divide evenly'] },
-  { name: 'The Ex-Texter',                mult: [0.05, 0.20],  tags: ['ex','phone','texting','texted','on the phone','stepped out','took a call'] },
-  { name: 'The Crying Toddler Delegate',  mult: [-0.10, 0.10], tags: ['baby','toddler','kid','child','stroller','sippy','screaming','cried','highchair'] },
-  { name: 'The Group Photographer',       mult: [-0.05, 0.05], tags: ['photo','photos','picture','group photo','selfie','took pictures','for the gram','instagram','posted'] },
-  { name: 'The Ambient Vegetarian Judge', mult: [0.00, 0.15],  tags: ['judged','judging','stared','rolled her eyes','rolled his eyes','rolled their eyes','eyerolled','side-eyed','sighed'] },
-  { name: 'The Menu Re-Reader',           mult: [0.05, 0.15],  tags: ['menu','still looking','took forever','couldnt decide','changed my order','changed their order'] },
-  { name: 'The Group-Chat Monarch',       mult: [0.10, 0.25],  tags: ['group chat','organized','planned','planning','sent the link','who sent','picked the time'] },
-  { name: 'The Dessert Insurgent',        mult: [0.05, 0.20],  tags: ['dessert','tiramisu','creme brulee','cheesecake','cake','affogato','sundae'] },
-  { name: 'The Tip Optimizer',            mult: [0.10, 0.25],  tags: ['tip','15','18','20','percent','%','gratuity','service charge','tip calculator'] },
-  { name: 'The Upsell Casualty',          mult: [0.10, 0.25],  tags: ['upgrade','added','got the','deluxe','chef special','specials','upsell'] },
-  { name: 'The Unsolicited Sommelier',    mult: [0.15, 0.30],  tags: ['recommended','explained the wine','explained','lectured','lecture','gave a speech','held court'] },
-  { name: 'The Double-Entree Defendant',  mult: [0.30, 0.55],  tags: ['two entrees','second lobster','second entree','ordered two','a second','ordered a second','extra entree'] },
-  { name: 'The Complimentary-Bread Loyalist', mult: [-0.10, 0.05], tags: ['bread','breadbasket','bread basket','more bread','basket of bread','butter'] },
-];
-
-// Broad keyword rules that fire when nothing in the per-verdict tag list matches.
-// Deterministic secondary fallback: pick by seeded index.
 const FALLBACK_VERDICTS = [
-  { name: 'The Low-Key Defendant',        mult: [0.00, 0.10] },
-  { name: 'The Ambient Enabler',          mult: [0.00, 0.12] },
-  { name: 'The Procedural Bystander',     mult: [-0.05, 0.05] },
-  { name: 'The Deeply Innocent Suspect',  mult: [-0.08, 0.03] },
-  { name: 'The Unindicted Co-Diner',      mult: [0.00, 0.08] },
+  { name: 'The Lobster Heiress',         mult: [0.25, 0.55] },
+  { name: 'The Unpaid Narrator',         mult: [0.20, 0.50] },
+  { name: 'The Crypto Homily Giver',     mult: [0.15, 0.30] },
+  { name: 'The Side-Eye Ascetic',        mult: [-0.20, -0.05] },
+  { name: 'The Sommelier Volunteer',     mult: [0.20, 0.45] },
+  { name: 'The Appetizer Opportunist',   mult: [0.05, 0.15] },
+  { name: 'The Split Evangelist',        mult: [-0.05, 0.10] },
+  { name: 'The Reservation Dictator',    mult: [0.05, 0.15] },
+  { name: 'The Group-Chat Monarch',      mult: [0.10, 0.25] },
+  { name: 'The Tip Optimizer',           mult: [0.10, 0.25] },
+  { name: 'The Low-Key Defendant',       mult: [0.00, 0.10] },
+  { name: 'The Ambient Enabler',         mult: [0.00, 0.12] },
+  { name: 'The Procedural Bystander',    mult: [-0.05, 0.05] },
+  { name: 'The Deeply Innocent Suspect', mult: [-0.08, 0.03] },
+  { name: 'The Unindicted Co-Diner',     mult: [0.00, 0.08] },
 ];
 
-function pickVerdict(name, behaviorText, seed) {
-  const lower = (name + ' ' + behaviorText).toLowerCase();
-  // Strip punctuation for robust tag matching.
-  const norm = lower.replace(/[^\w\s%]/g, ' ').replace(/\s+/g, ' ');
-
-  // Score each verdict by number of tag hits.
-  let best = null;
-  let bestScore = 0;
-  for (const v of VERDICTS) {
-    let score = 0;
-    for (const t of v.tags) {
-      if (norm.indexOf(t) !== -1) score++;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      best = v;
-    }
-  }
-  if (best) return best;
-
-  const idx = seed % FALLBACK_VERDICTS.length;
-  return FALLBACK_VERDICTS[idx];
+function fallbackVerdictForSeed(seed) {
+  return FALLBACK_VERDICTS[seed % FALLBACK_VERDICTS.length];
 }
 
-// ---------- parsing + totals ----------
+// Given a verdict *name* picked by the LLM, infer a spite-multiplier range.
+// If the name doesn't match any known archetype (the LLM is free to invent
+// new ones), we classify it by sentiment heuristics so the math still works.
+function multForVerdictName(name) {
+  const known = FALLBACK_VERDICTS.find(v => v.name.toLowerCase() === String(name || '').toLowerCase());
+  if (known) return known.mult;
+  const lower = String(name || '').toLowerCase();
+  // Positive / innocent-sounding invented verdicts pay slightly less.
+  if (/innocent|ascetic|abstainer|saint|water|quiet|frugal/.test(lower)) return [-0.15, 0.00];
+  // Clearly guilty-sounding invented verdicts pay more.
+  if (/heiress|glutton|sommelier|lobster|crypto|monarch|dictator|chaos|defendant|freeloader|tyrant|narrator|volunteer|evangelist|opportunist/.test(lower)) return [0.15, 0.40];
+  // Default: slight positive bias.
+  return [0.00, 0.15];
+}
+
+// ---------- LOCAL FALLBACK parsing (used only if the LLM extract fails) ----------
 //
-// Smart parsing: accepts either one-person-per-line OR a run-on paragraph with
-// multiple people. We detect capitalized-name boundaries to re-segment a run-on
-// block. Voice dictation often produces one long sentence — we refuse to make
-// the user babysit "one line per person".
+// Crude name-first extractor: splits on sentence boundaries, keeps entries
+// where the first token is capitalized. Not as smart as the old parser on
+// purpose — the LLM is the happy path.
 
-// Common filler words that happen to be capitalized at sentence starts; we do
-// NOT want to treat these as a new diner.
-const NAME_STOPWORDS = new Set([
-  'then','and','but','also','while','meanwhile','okay','ok','so','then,','also,',
-  'plus','next','after','before','then.','after.','later','finally','i',"i'll","i'd",'me','my',
-  'we','they','he','she','it','the','a','an','this','that','these','those',
-  'meanwhile,', 'meanwhile.', 'and,', 'but,', 'so,',
-]);
-
-function looksLikeName(token) {
-  if (!token) return false;
-  // Strip punctuation.
-  const clean = token.replace(/[^A-Za-z'\-]/g, '');
-  if (!clean) return false;
-  if (clean.length < 2 || clean.length > 20) return false;
-  // Must start with uppercase and have at least one more lowercase (rejects
-  // "I", "OK", "NYC" etc.).
-  if (clean[0] !== clean[0].toUpperCase()) return false;
-  if (!/[a-z]/.test(clean.slice(1))) return false;
-  if (NAME_STOPWORDS.has(clean.toLowerCase())) return false;
-  return true;
-}
-
-// Given a single run-on line like "Ben ordered the lobster. Sarah forgot her
-// wallet. Kai talked about crypto.", return an array of per-person strings.
-// If we can't confidently split, return the whole line as one entry.
-function splitRunOnLine(line) {
-  if (!line) return [];
-  // First try sentence-level splits (.?!).
-  const sentenceParts = line
-    .split(/(?<=[.!?])\s+(?=[A-Z])/)
-    .map(s => s.trim())
-    .filter(Boolean);
-
-  // Start from sentences, then try to detect within-sentence name boundaries
-  // for very long sentences that forgot their periods.
-  const results = [];
-  for (const seg of sentenceParts) {
-    const split = splitBySecondaryNames(seg);
-    if (split.length > 1) {
-      for (const s of split) if (s.trim()) results.push(s.trim());
-    } else {
-      results.push(seg.trim());
-    }
-  }
-  // Only accept the split if at least 2 candidate names emerged AND the first
-  // token of each candidate looks like a name. Otherwise, fall back to the
-  // whole line.
-  const nameLike = results.filter(r => {
-    const first = r.split(/\s+/)[0] || '';
-    return looksLikeName(first);
-  });
-  if (nameLike.length >= 2) return results;
-  // Otherwise the line is probably a single person; keep as-is.
-  return [line.trim()];
-}
-
-// Within a single sentence, split at capitalized-name boundaries that are
-// preceded by a conjunction/connector or a comma/"then". Conservative: only
-// splits if the boundary candidate starts a new capitalized word that isn't
-// a stopword.
-function splitBySecondaryNames(sentence) {
-  // Candidate boundaries: ", Name " or " then Name " or " and Name " or " meanwhile Name ".
-  const boundaries = [];
-  const re = /(?:,\s*|\s+(?:then|and|but|so|meanwhile|plus|also|next)\s+)([A-Z][a-z'\-]+)\b/g;
-  let m;
-  while ((m = re.exec(sentence)) !== null) {
-    const nameIdx = m.index + m[0].indexOf(m[1]);
-    // Skip if this "name" is actually a stopword.
-    if (NAME_STOPWORDS.has(m[1].toLowerCase())) continue;
-    boundaries.push(nameIdx);
-  }
-  if (!boundaries.length) return [sentence];
-  const out = [];
-  let prev = 0;
-  for (const idx of boundaries) {
-    out.push(sentence.slice(prev, idx));
-    prev = idx;
-  }
-  out.push(sentence.slice(prev));
-  return out;
-}
-
-function parseLog(raw) {
-  // Returns list of { name, behavior }.
-  // Accept both "one person per line" AND a single run-on paragraph with
-  // multiple people. We split the raw text on newlines first, then apply
-  // smart sentence-splitting to any line that contains multiple name-like
-  // boundaries.
-  const lines = String(raw || '')
-    .split(/\r?\n/)
-    .map(s => s.trim())
-    .filter(Boolean);
-
-  const expanded = [];
-  for (const line of lines) {
-    const parts = splitRunOnLine(line);
-    for (const p of parts) if (p.trim()) expanded.push(p.trim());
-  }
-
+function fallbackParse(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return [];
+  const segments = text.split(/(?:\r?\n|(?<=[.!?])\s+)/).map(s => s.trim()).filter(Boolean);
   const out = [];
   const seen = new Set();
-  for (const rawEntry of expanded) {
-    // Remove leading bullets/dashes.
-    const cleaned = rawEntry.replace(/^[-*\u2022]\s*/, '').trim();
-    if (!cleaned) continue;
-
-    // Primary: explicit separator between name and behavior.
-    let m = cleaned.match(/^([A-Za-z][\w.'\-]*)\s*[\u2014\u2013:,\-]\s*(.+)$/);
-    let name, behavior;
-    if (m) {
-      name = m[1];
-      behavior = m[2].trim();
-    } else {
-      // Fall back to first whitespace-separated token as the name.
-      const parts = cleaned.split(/\s+/);
-      name = parts[0];
-      behavior = parts.slice(1).join(' ').trim();
-    }
-    if (!name) continue;
-    // If the "name" looks like it isn't actually a name (lowercase word from a
-    // mid-sentence fragment), skip the entry rather than emit a bogus diner.
-    if (!looksLikeName(name)) continue;
-    if (!behavior) behavior = '(no notes)';
-    // Clean up stray leading connector words that survived the split (e.g.
-    // "then Sarah forgot her wallet" → name=Sarah, behavior leftover "forgot...").
-    behavior = behavior.replace(/^(then|and|but|so|meanwhile|plus|also|next)\s+/i, '');
-    // Clean up trailing separators/conjunctions and punctuation.
-    behavior = behavior
-      .replace(/\s+/g, ' ')
-      .replace(/[.,;]+$/, '')
-      .replace(/\s+(then|and|but|so|meanwhile|plus|also|next)\s*$/i, '')
-      .trim();
-
-    // Dedupe by normalized name (voice dictation sometimes emits the same
-    // sentence twice). Keep the first occurrence.
-    const key = name.toLowerCase();
+  for (const seg of segments) {
+    const first = seg.split(/\s+/)[0] || '';
+    const clean = first.replace(/[^A-Za-z'\-]/g, '');
+    if (!clean) continue;
+    if (clean[0] !== clean[0].toUpperCase()) continue;
+    if (!/[a-z]/.test(clean.slice(1))) continue;
+    const key = clean.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-
-    out.push({ name, behavior });
+    const behavior = seg.slice(first.length).replace(/^[\s\-\u2013\u2014:,.]+/, '').trim() || '(no notes)';
+    out.push({ name: clean, behavior });
   }
   return out;
 }
 
-function validateInput(bill, people) {
-  if (!(bill >= 1 && bill <= 99999)) {
-    return 'bill total needs to be a number between $1 and $99,999.';
-  }
-  if (people.length < MIN_PEOPLE) {
-    return `we need at least ${MIN_PEOPLE} diners. name a few more people and what they did.`;
-  }
-  if (people.length > MAX_PEOPLE) {
-    return `max ${MAX_PEOPLE} people per receipt — the pettiness doesn't scale past six.`;
-  }
-  return null;
-}
-
-// ---------- core computation (deterministic, total-preserving) ----------
+// ---------- LLM: extract diners + verdicts + line-items in one call ----------
 //
-// Strategy: each person starts with weight 1. Apply their spite multiplier to
-// get a biased weight (1 + mult). Normalize weights to sum to 1, then multiply
-// by the stated bill. This guarantees sum(amounts) === bill exactly (to cents,
-// after a final rounding pass that reconciles any half-cent drift into the
-// last person). Per-person spite delta = amount_owed − fair_share.
+// One call. Receives the stated bill + the free-form log. Returns an ordered
+// list of diners with a verdict and line-item for each. Client then does the
+// cents-accurate money allocation so totals sum to the bill exactly.
 
-function computeReceipt(bill, people) {
-  const fullInput = JSON.stringify({ b: bill.toFixed(2), p: people });
-  const seed = hash(fullInput);
-
-  const fairShare = bill / people.length;
-
-  // Per-person: pick verdict, compute weights deterministically.
-  const draft = people.map((p, i) => {
-    const localSeed = hash(p.name + '|' + p.behavior + '|' + i);
-    const verdict = pickVerdict(p.name, p.behavior, localSeed);
-
-    // Spite multiplier: interpolate deterministically between mult[0] and mult[1].
-    const r = mulberry32(localSeed)();
-    const mult = verdict.mult[0] + (verdict.mult[1] - verdict.mult[0]) * r;
-    // Clamp to a sane weight range so no one gets a zero share.
-    const weight = Math.max(0.2, 1 + mult);
-
-    return {
-      name: p.name,
-      behavior: p.behavior,
-      verdict: verdict.name,
-      mult,
-      weight,
-      is_spicy: Math.abs(mult) >= 0.2,
-      localSeed,
-    };
-  });
-
-  // Normalize weights so their sum == bill.
-  const weightSum = draft.reduce((s, d) => s + d.weight, 0);
-  // Cents-accurate allocation: compute each cent amount, track rounding residue.
-  const billCents = Math.round(bill * 100);
-  let allocated = 0;
-  const amountsCents = draft.map((d, i) => {
-    if (i === draft.length - 1) {
-      // Last person absorbs the rounding residue so the sum equals the bill exactly.
-      return billCents - allocated;
-    }
-    const share = (d.weight / weightSum) * billCents;
-    const c = Math.round(share);
-    allocated += c;
-    return c;
-  });
-
-  const results = draft.map((d, i) => {
-    const amount_owed = amountsCents[i] / 100;
-    const spite_delta = amount_owed - fairShare;
-    return {
-      name: d.name,
-      behavior: d.behavior,
-      fair_share: fairShare,
-      spite_delta,
-      verdict: d.verdict,
-      is_spicy: d.is_spicy,
-      amount_owed,
-      line_items: buildLocalLineItems(
-        { name: d.name, behavior: d.behavior },
-        { name: d.verdict },
-        spite_delta,
-        fairShare,
-        d.localSeed
-      ),
-    };
-  });
-
-  // Redistribution magnitude = sum of positive deltas (equals abs(sum of negatives)).
-  const spiteRedistribution = results.reduce(
-    (s, p) => s + Math.max(0, p.spite_delta),
-    0
-  );
-
-  return {
-    bill,
-    fair_share: fairShare,
-    spite_redistribution: spiteRedistribution,
-    new_total: bill,  // total-preserving: always equals stated bill
-    people: results,
-    seed,
-    receipt_id: receiptIdFromSeed(seed),
-    date: todayStr(),
-    _source: 'local',
-  };
-}
-
-// Locally-composed line-items: one "share of dinner" at fair-share, one spite
-// adjustment (the delta from fair-share). These sum to amount_owed, and across
-// all diners sum to the stated bill.
-function buildLocalLineItems(person, verdict, spiteDelta, fairShare, localSeed) {
-  const quipBank = [
-    (b) => `"${b}" — surcharge`,
-    (b) => `"${b}" — filed as evidence`,
-    (b) => `"${b}" — petty tax`,
-    (b) => `"${b}" — assessed`,
-    (b) => `"${b}" — noted for the record`,
-    (b) => `"${b}" — line-itemed`,
-    (b) => `"${b}" — billed`,
-  ];
-  const quip = quipBank[localSeed % quipBank.length](truncate(person.behavior, 64));
-
-  const items = [
-    { desc: 'share of dinner',                 amount: fairShare,  cls: '' },
-    { desc: quip,                              amount: spiteDelta, cls: spiteDelta >= 0 ? 'pos' : 'neg' },
-  ];
-  return items;
-}
-
-function truncate(s, n) {
-  if (s.length <= n) return s;
-  return s.slice(0, n - 1).trimEnd() + '\u2026';
-}
-
-// ---------- LLM flourish (one call per user journey; deterministic fallback) ----------
-
-function buildMessages(receipt) {
-  const peopleSummaries = receipt.people.map((p, i) =>
-    `  ${i + 1}. name: ${JSON.stringify(p.name)}; behavior: ${JSON.stringify(p.behavior)}; verdict: ${JSON.stringify(p.verdict)}`
-  ).join('\n');
-
+function buildExtractMessages(bill, rawLog) {
   const system =
-    `You are a petty, deadpan bill-splitter writing a single one-line "item" per diner for a fake itemized restaurant receipt. Voice: dry, slightly mean, surgically specific. No emojis. No hashtags. No preamble.\n\n` +
-    `You will be given 3–6 diners. For each one you MUST return ONE snarky line-item that:\n` +
-    `- Quotes the diner's own behavior verbatim in double-quotes somewhere in the line (copy their words; do not paraphrase).\n` +
-    `- Is ≤ 14 words total.\n` +
-    `- Ends with an em-dash followed by a charge-name (examples: "— lobster tax", "— narrator fee", "— crypto homily surcharge", "— wallet amnesia penalty"). Invent a specific charge-name for each person. Do NOT reuse the same charge-name twice in one response.\n` +
-    `- Does NOT include a dollar amount. No numbers. The amount is computed by the app.\n` +
-    `- Does NOT address the diner in second person.\n\n` +
-    `HARD RULES:\n` +
-    `- Respond with ONLY a single JSON object matching the schema below. No markdown, no code fences, no commentary, no "here is your receipt", no trailing questions.\n` +
-    `- Do not offer to refine, expand, or regenerate. The UI has no chat input.\n\n` +
+    `You are a petty, deadpan forensic accountant reading a messy log of what happened at a shared meal. You MUST:\n\n` +
+    `1. Identify every distinct diner named in the log. If a person is mentioned but was not actually eating (e.g. "our server", "the host", "the ex she texted"), exclude them. Include anyone who contributed to the bill even if the narrator was mean about them. There is NO upper limit on diners — list everyone.\n` +
+    `2. Paraphrase tightly what each diner did in one short clause (≤ 100 chars), keeping the specific damning detail (lobster, crypto speech, forgot wallet, only water, etc.). Quote the user's own wording when it's already good.\n` +
+    `3. Assign each diner a "verdict" archetype — a Title-Cased noun phrase that functions as a label on the receipt. Prefer these canonical verdicts when they fit: "The Lobster Heiress", "The Unpaid Narrator", "The Crypto Homily Giver", "The Side-Eye Ascetic", "The Sommelier Volunteer", "The Appetizer Opportunist", "The Split Evangelist", "The Reservation Dictator", "The Group-Chat Monarch", "The Tip Optimizer", "The Low-Key Defendant", "The Ambient Enabler", "The Procedural Bystander", "The Deeply Innocent Suspect", "The Unindicted Co-Diner". You may invent new ones in the same style when nothing canonical fits — always start with "The " and stay under 34 chars. Do NOT reuse a verdict across diners in the same bill.\n` +
+    `4. Give each diner a "spite_score" from -1.0 to +1.0. Positive = they ran up the damages or behaved badly and should pay more. Negative = they barely ate / were dragged along and should pay less. 0 = neutral. Be opinionated. A lobster orderer is +0.7. Someone who only had water is -0.6. Forgot their wallet is +0.5. Birthday person is ~0.\n` +
+    `5. Write a one-line "item" per diner for the itemized receipt. Rules:\n` +
+    `   - Quote the diner's own behavior verbatim in double-quotes somewhere in the line (copy their words; do not paraphrase inside the quotes).\n` +
+    `   - ≤ 14 words total.\n` +
+    `   - End with an em-dash followed by a charge-name (examples: "— lobster tax", "— narrator fee", "— crypto homily surcharge", "— wallet amnesia penalty"). Invent a specific charge-name for each person. Do NOT reuse the same charge-name twice.\n` +
+    `   - No dollar amounts. No numbers. The app computes amounts.\n` +
+    `   - Do not address the diner in second person.\n\n` +
+    `HARD OUTPUT RULES:\n` +
+    `- Respond with ONLY a single JSON object matching the schema. No markdown, no code fences, no commentary, no "here is your receipt", no trailing questions. Do not offer to refine.\n\n` +
     `SCHEMA:\n` +
     `{\n` +
-    `  "items": [\n` +
-    `    { "name": string, "item": string }   // exactly ${receipt.people.length} entries, in the SAME order as input, each "name" matching the input name\n` +
+    `  "diners": [\n` +
+    `    { "name": string, "behavior": string, "verdict": string, "spite_score": number, "item": string }\n` +
     `  ]\n` +
     `}\n\n` +
     `Examples of the required item style (do not copy verbatim):\n` +
@@ -476,8 +205,8 @@ function buildMessages(receipt) {
     `- "\\"talked about crypto for 40 minutes\\" — airtime tax"\n`;
 
   const user =
-    `Stated bill: $${receipt.bill.toFixed(2)} across ${receipt.people.length} diners.\n\n` +
-    `Diners:\n${peopleSummaries}\n\n` +
+    `Stated bill: $${bill.toFixed(2)}\n\n` +
+    `Log of what happened:\n${rawLog.trim()}\n\n` +
     `Return the JSON object only.`;
 
   return [
@@ -486,33 +215,71 @@ function buildMessages(receipt) {
   ];
 }
 
-function sanitizeLLMItems(parsed, receipt) {
+function sanitizeExtract(parsed) {
   if (!parsed || typeof parsed !== 'object') return null;
-  const arr = Array.isArray(parsed.items) ? parsed.items : null;
-  if (!arr || arr.length !== receipt.people.length) return null;
+  const arr = Array.isArray(parsed.diners) ? parsed.diners : null;
+  if (!arr || !arr.length) return null;
 
-  const lineMap = {};
-  for (let i = 0; i < receipt.people.length; i++) {
-    const entry = arr[i];
-    if (!entry || typeof entry !== 'object') return null;
+  const diners = [];
+  const seenNames = new Set();
+  const seenVerdicts = new Set();
+
+  for (const entry of arr) {
+    if (!entry || typeof entry !== 'object') continue;
+    let name = typeof entry.name === 'string' ? entry.name.trim() : '';
+    let behavior = typeof entry.behavior === 'string' ? entry.behavior.trim() : '';
+    let verdict = typeof entry.verdict === 'string' ? entry.verdict.trim() : '';
     const item = typeof entry.item === 'string' ? entry.item.trim() : '';
-    if (!item) return null;
-    if (item.length > 220) return null;
-    lineMap[i] = item;
+    const spite = Number(entry.spite_score);
+
+    if (!name || name.length > 40) continue;
+    if (!verdict || verdict.length > 40) verdict = 'The Low-Key Defendant';
+    if (!behavior) behavior = '(no notes)';
+    if (behavior.length > 200) behavior = behavior.slice(0, 199) + '\u2026';
+    if (!item || item.length > 220) continue;
+    if (!Number.isFinite(spite)) continue;
+
+    // Dedupe by case-insensitive name (e.g. LLM double-counted the same
+    // person mentioned twice in the log).
+    const nk = name.toLowerCase();
+    if (seenNames.has(nk)) continue;
+    seenNames.add(nk);
+
+    // Ensure unique verdicts per bill. If the LLM reused one, append an
+    // ordinal suffix so the receipt still reads right.
+    let vk = verdict;
+    let n = 2;
+    while (seenVerdicts.has(vk.toLowerCase())) {
+      vk = verdict + ' (' + n + ')';
+      n++;
+    }
+    seenVerdicts.add(vk.toLowerCase());
+
+    diners.push({
+      name,
+      behavior,
+      verdict: vk,
+      spite_score: Math.max(-1, Math.min(1, spite)),
+      item,
+    });
+
+    if (diners.length >= HARD_MAX_PEOPLE) break;
   }
-  return lineMap;
+
+  if (diners.length < MIN_PEOPLE) return null;
+  return diners;
 }
 
-async function tryLLMFlourish(receipt) {
+async function tryLLMExtract(bill, rawLog) {
   try {
     const res = await fetch(AI_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         slug: SLUG,
-        messages: buildMessages(receipt),
+        messages: buildExtractMessages(bill, rawLog),
         model: 'gpt-5.4-mini',
-        max_tokens: 400,
+        max_tokens: 1400,
         temperature: 0,
         response_format: 'json_object',
       }),
@@ -522,35 +289,115 @@ async function tryLLMFlourish(receipt) {
     const raw = (data && data.content) || '';
     let parsed = null;
     try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-    const map = sanitizeLLMItems(parsed, receipt);
-    if (!map) return null;
-    return map;
+    return sanitizeExtract(parsed);
   } catch (_) {
     return null;
   }
 }
 
-// Apply the LLM quip into the "quote" line-item for each person, keeping the
-// spite-delta dollar amount intact.
-function applyFlourish(receipt, map) {
-  if (!map) return receipt;
-  const out = { ...receipt, _source: 'ai', people: receipt.people.map((p, i) => {
-    const quip = map[i];
-    if (!quip) return p;
-    const items = p.line_items.slice();
-    if (items[1]) {
-      items[1] = { ...items[1], desc: quip };
+// ---------- core computation (deterministic, total-preserving) ----------
+//
+// Strategy: each diner has a spite_score in [-1, 1]. Convert to a weight
+// biased by (1 + score * k). Normalize weights to sum to 1, then multiply
+// by the stated bill. This guarantees sum(amounts) === bill exactly (to
+// cents, after a final rounding pass that reconciles any half-cent drift
+// into the last person). Per-person spite delta = amount_owed − fair_share.
+
+const SPITE_SCALE = 0.5; // maps [-1, 1] → weight multiplier of [-0.5, +0.5]
+
+function buildReceiptFromDiners(bill, diners, { source }) {
+  const fullInput = JSON.stringify({ b: bill.toFixed(2), d: diners });
+  const seed = hash(fullInput);
+  const fairShare = bill / diners.length;
+
+  const draft = diners.map((d, i) => {
+    const localSeed = hash(d.name + '|' + d.behavior + '|' + i);
+
+    // Prefer an explicit spite_score from the LLM; otherwise derive a
+    // deterministic multiplier from the verdict name's known range.
+    let mult;
+    if (Number.isFinite(d.spite_score)) {
+      mult = Math.max(-1, Math.min(1, d.spite_score)) * SPITE_SCALE;
+    } else {
+      const range = multForVerdictName(d.verdict);
+      const r = mulberry32(localSeed)();
+      mult = range[0] + (range[1] - range[0]) * r;
     }
-    return { ...p, line_items: items };
-  })};
-  return out;
+
+    const weight = Math.max(0.2, 1 + mult);
+    return { ...d, localSeed, mult, weight };
+  });
+
+  const weightSum = draft.reduce((s, d) => s + d.weight, 0);
+  const billCents = Math.round(bill * 100);
+  let allocated = 0;
+  const amountsCents = draft.map((d, i) => {
+    if (i === draft.length - 1) return billCents - allocated;
+    const share = (d.weight / weightSum) * billCents;
+    const c = Math.round(share);
+    allocated += c;
+    return c;
+  });
+
+  const people = draft.map((d, i) => {
+    const amount_owed = amountsCents[i] / 100;
+    const spite_delta = amount_owed - fairShare;
+    const item_text = d.item || buildLocalItem(d, spite_delta, d.localSeed);
+    return {
+      name: d.name,
+      behavior: d.behavior,
+      fair_share: fairShare,
+      spite_delta,
+      verdict: d.verdict,
+      is_spicy: Math.abs(d.mult) >= 0.15,
+      amount_owed,
+      line_items: [
+        { desc: 'share of dinner', amount: fairShare,  cls: '' },
+        { desc: item_text,         amount: spite_delta, cls: spite_delta >= 0 ? 'pos' : 'neg' },
+      ],
+    };
+  });
+
+  const spiteRedistribution = people.reduce(
+    (s, p) => s + Math.max(0, p.spite_delta),
+    0
+  );
+
+  return {
+    bill,
+    fair_share: fairShare,
+    spite_redistribution: spiteRedistribution,
+    new_total: bill,
+    people,
+    seed,
+    receipt_id: receiptIdFromSeed(seed),
+    date: todayStr(),
+    _source: source,
+  };
+}
+
+function buildLocalItem(person, spiteDelta, localSeed) {
+  const quipBank = [
+    (b) => `"${b}" — surcharge`,
+    (b) => `"${b}" — filed as evidence`,
+    (b) => `"${b}" — petty tax`,
+    (b) => `"${b}" — assessed`,
+    (b) => `"${b}" — noted for the record`,
+    (b) => `"${b}" — line-itemed`,
+    (b) => `"${b}" — billed`,
+  ];
+  return quipBank[localSeed % quipBank.length](truncate(person.behavior, 64));
+}
+
+function truncate(s, n) {
+  if (s.length <= n) return s;
+  return s.slice(0, n - 1).trimEnd() + '\u2026';
 }
 
 // ---------- fragment state ----------
 //
 // Shape:
-//   #r=<base64url of { b: billCents, d: [ { n, v, a, q } ] }>
-// Re-hydration reconstructs fair_share and spite_delta from amount+bill/count.
+//   #r=<base64url of { b: billCents, d: [ { n, b, v, a, q, s } ] }>
 
 function encodeReceiptToFragment(receipt) {
   const payload = {
@@ -574,7 +421,7 @@ function decodeFragment() {
   if (!m) return null;
   const obj = b64urlDecode(m[1]);
   if (!obj || typeof obj !== 'object') return null;
-  if (!Array.isArray(obj.d) || obj.d.length < MIN_PEOPLE || obj.d.length > MAX_PEOPLE) return null;
+  if (!Array.isArray(obj.d) || obj.d.length < MIN_PEOPLE || obj.d.length > HARD_MAX_PEOPLE) return null;
   return obj;
 }
 
@@ -602,9 +449,6 @@ function receiptFromFragment(obj) {
     (s, p) => s + Math.max(0, p.spite_delta),
     0
   );
-  // Use the sum of encoded amounts as the authoritative total so that old
-  // additive-model share links still render a coherent receipt (total matches
-  // per-person sum). New links sum to the stated bill by construction.
   const totalOwed = people.reduce((s, p) => s + p.amount_owed, 0);
   return {
     bill,
@@ -633,14 +477,22 @@ function showScreen(name) {
 }
 
 function updateLineCount() {
+  // Lightweight guess at diner count for the intake hint — just counts
+  // non-empty lines / sentences that start with a capitalized token. The
+  // real extraction happens on submit via the LLM.
   const el = $('log');
   const countEl = $('line-count');
   if (!el || !countEl) return;
-  const lines = parseLog(el.value);
-  const n = lines.length;
-  countEl.textContent = `${n} / ${MAX_PEOPLE} people`;
-  countEl.classList.toggle('ready', n >= MIN_PEOPLE && n <= MAX_PEOPLE);
-  countEl.classList.toggle('over',  n > MAX_PEOPLE);
+  const guess = fallbackParse(el.value).length;
+  if (guess === 0) {
+    countEl.textContent = 'no diners yet';
+  } else if (guess === 1) {
+    countEl.textContent = '1 diner';
+  } else {
+    countEl.textContent = `${guess} diners`;
+  }
+  countEl.classList.toggle('ready', guess >= MIN_PEOPLE);
+  countEl.classList.remove('over');
 }
 
 function renderReceipt(receipt) {
@@ -691,8 +543,6 @@ function renderReceipt(receipt) {
   });
 
   $('bill-stated').textContent = fmtMoney(receipt.bill);
-  // Redistribution magnitude, shown as ±$X — spite moves X dollars from the
-  // innocents to the guilty, but total paid stays equal to the stated bill.
   $('spite-adj').textContent = '\u00B1' + fmtMoney(receipt.spite_redistribution);
   $('bill-total-out').textContent = fmtMoney(receipt.new_total);
 
@@ -707,18 +557,51 @@ function parseBill(raw) {
   return isFinite(n) ? n : NaN;
 }
 
-async function runSplit({ bill, people }, { updateFragment = true } = {}) {
+async function runSplit({ bill, rawLog }, { updateFragment = true } = {}) {
   showScreen('loading');
 
-  // Deterministic local receipt first.
-  let receipt = computeReceipt(bill, people);
-
-  // Run the LLM flourish in parallel with a minimum loader time (~900ms).
+  // Happy path: the LLM extracts diners, verdicts, and item-lines all in
+  // one call. Run a minimum loader time in parallel so the transition
+  // doesn't feel glitchy on fast connections.
   const minDelay = new Promise(r => setTimeout(r, 900));
+  let diners = null;
   try {
-    const [flourish] = await Promise.all([tryLLMFlourish(receipt), minDelay]);
-    if (flourish) receipt = applyFlourish(receipt, flourish);
-  } catch (_) { /* keep local receipt */ }
+    const [ext] = await Promise.all([tryLLMExtract(bill, rawLog), minDelay]);
+    diners = ext;
+  } catch (_) { /* fall through */ }
+
+  let receipt;
+  if (diners && diners.length >= MIN_PEOPLE) {
+    receipt = buildReceiptFromDiners(bill, diners, { source: 'ai' });
+  } else {
+    // Fallback: crude local extraction, then deterministic verdict assignment.
+    const local = fallbackParse(rawLog).slice(0, HARD_MAX_PEOPLE).map((p, i) => {
+      const seed = hash(p.name + '|' + p.behavior + '|' + i);
+      const v = fallbackVerdictForSeed(seed);
+      const r = mulberry32(seed)();
+      const mult = v.mult[0] + (v.mult[1] - v.mult[0]) * r;
+      // Convert our [-1, +1]-ish mult back into a spite_score for the builder.
+      const spite_score = Math.max(-1, Math.min(1, mult / SPITE_SCALE));
+      return {
+        name: p.name,
+        behavior: p.behavior,
+        verdict: v.name,
+        spite_score,
+        item: null, // buildReceiptFromDiners will synth a local quip
+      };
+    });
+    if (local.length < MIN_PEOPLE) {
+      // Couldn't even find 2 names locally — bail back to intake with copy.
+      showScreen('intake');
+      const errEl = $('intake-error');
+      if (errEl) {
+        errEl.textContent = 'couldn\u2019t pull names out of that. name at least two diners and what they did.';
+        errEl.classList.remove('hidden');
+      }
+      return;
+    }
+    receipt = buildReceiptFromDiners(bill, local, { source: 'local' });
+  }
 
   if (updateFragment) {
     history.replaceState(null, '', encodeReceiptToFragment(receipt));
@@ -729,18 +612,24 @@ async function runSplit({ bill, people }, { updateFragment = true } = {}) {
 function onSubmit(e) {
   e.preventDefault();
   const bill = parseBill($('bill-total').value);
-  const people = parseLog($('log').value);
-
-  const err = validateInput(bill, people);
+  const rawLog = String($('log').value || '').trim();
   const errEl = $('intake-error');
-  if (err) {
-    errEl.textContent = err;
+
+  if (!(bill >= 1 && bill <= 99999)) {
+    errEl.textContent = 'bill total needs to be a number between $1 and $99,999.';
+    errEl.classList.remove('hidden');
+    return;
+  }
+  // We only guard against an empty log on the client. The real diner-count
+  // floor is enforced after the LLM extract in runSplit — this lets the
+  // model handle messy inputs where a cheap regex couldn't find names.
+  if (!rawLog) {
+    errEl.textContent = `tell us who was there and what they did. at least ${MIN_PEOPLE} people.`;
     errEl.classList.remove('hidden');
     return;
   }
   errEl.classList.add('hidden');
-
-  runSplit({ bill, people });
+  runSplit({ bill, rawLog });
 }
 
 function onReset() {
@@ -749,6 +638,7 @@ function onReset() {
   $('bill-total').value = '184.00';
   stopVoice();
   updateLineCount();
+  resetScanUI();
   $('intake-error').classList.add('hidden');
   showScreen('intake');
   const logEl = $('log');
@@ -771,12 +661,6 @@ function onSample() {
 }
 
 // ---------- voice intake (MediaRecorder → Whisper proxy) ----------
-//
-// Tap the mic to start, tap again to stop. When stopped, the recording is
-// POSTed to the factory's speech proxy (OpenAI Whisper) and the transcript
-// is appended to the textarea. Whisper is materially more accurate than the
-// browser's Web Speech API and works uniformly on Firefox/Safari/iOS/Android.
-// Text path always works as a fallback. Audio is sent to OpenAI for transcription.
 
 const hasMediaRecorder =
   typeof window !== 'undefined' &&
@@ -788,7 +672,7 @@ let mediaRecorder = null;
 let voiceChunks = [];
 let voiceState = 'idle';      // 'idle' | 'starting' | 'listening' | 'transcribing'
 let voiceStopTimer = null;
-let voiceBaseText = '';       // textarea value at the start of the current session
+let voiceBaseText = '';
 
 function setMicStatus(text, cls) {
   const el = $('mic-status');
@@ -828,7 +712,7 @@ function pickAudioMime() {
   const candidates = [
     'audio/webm;codecs=opus',
     'audio/webm',
-    'audio/mp4',           // Safari
+    'audio/mp4',
     'audio/ogg;codecs=opus'
   ];
   if (window.MediaRecorder && MediaRecorder.isTypeSupported) {
@@ -877,7 +761,6 @@ async function startVoice() {
   mediaRecorder.onstart = () => {
     setMicButtonState('listening');
     setMicStatus('listening\u2026 say everyone\u2019s names and what they did', 'active');
-    // Safety cap — don't let a forgotten-on mic blow through the 5MB proxy limit.
     voiceStopTimer = setTimeout(() => {
       try { if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop(); } catch (_) {}
     }, MAX_RECORDING_MS);
@@ -890,10 +773,6 @@ async function startVoice() {
   mediaRecorder.onstop = async () => {
     if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
     const rawType = (mediaRecorder && mediaRecorder.mimeType) || mimeType || 'audio/webm';
-    // Safari's MediaRecorder reports mimeType with codec parameters
-    // (e.g. "audio/mp4;codecs=mp4a.40.2"). Strip them so the resulting
-    // data URL is "data:audio/mp4;base64,..." — the server's parser
-    // accepts parameters now, but keeping the URL clean is simpler.
     const blobType = rawType.split(';')[0].trim() || 'audio/webm';
     const blob = new Blob(voiceChunks, { type: blobType });
     voiceChunks = [];
@@ -931,7 +810,7 @@ async function startVoice() {
       }
       appendVoiceText(out);
       setMicButtonState('idle');
-      const parsedCount = parseLog(($('log') || {}).value || '').length;
+      const parsedCount = fallbackParse(($('log') || {}).value || '').length;
       setMicStatus('filed ' + parsedCount + ' diner' + (parsedCount === 1 ? '' : 's') + ' into the record', '');
     } catch (_) {
       setMicButtonState('idle');
@@ -953,7 +832,6 @@ function stopVoice() {
     return;
   }
   if (voiceState === 'starting') {
-    // Bail out before the recorder started capturing.
     cleanupStream();
     setMicButtonState('idle');
     setMicStatus('');
@@ -963,7 +841,6 @@ function stopVoice() {
 function toggleVoice() {
   if (voiceState === 'idle') startVoice();
   else if (voiceState === 'listening' || voiceState === 'starting') stopVoice();
-  // 'transcribing' is a no-op — button is disabled during the POST.
 }
 
 function cleanupStream() {
@@ -1036,16 +913,12 @@ function wireMic() {
   });
 }
 
-// ---------- receipt photo intake (vision proxy) ----------
-//
-// User snaps / uploads a photo of the physical receipt; we downscale client-side,
-// POST to the vision proxy, and fill the bill-total input with the extracted total.
+// ---------- receipt photo intake (vision proxy — fast tier) ----------
 
 const RECEIPT_MAX_EDGE = 1280;
 const RECEIPT_JPEG_QUALITY = 0.82;
 
 async function fileToScaledJpegDataURL(file) {
-  // Decode with createImageBitmap when available (handles HEIC on iOS, faster).
   let bitmap = null;
   try {
     if (typeof createImageBitmap === 'function') {
@@ -1101,12 +974,38 @@ function setScanButtonState(state) {
   }
 }
 
+// After a successful scan, collapse the scan row into a compact "filed"
+// chip so the button no longer dominates the form. User can tap the chip
+// to re-open the picker (clears the state first).
+function collapseScanRow(total) {
+  const row = $('scan-row');
+  if (!row) return;
+  row.classList.add('filed');
+  const lbl = $('scan-btn') && $('scan-btn').querySelector('.scan-label');
+  if (lbl) lbl.textContent = 'total filed: $' + total.toFixed(2) + ' \u2014 tap to redo';
+  // Hide the dashed-border look; the .filed class in CSS replaces it with a
+  // compact confirmation pill.
+}
+
+function resetScanUI() {
+  const row = $('scan-row');
+  if (!row) return;
+  row.classList.remove('filed');
+  setScanButtonState('idle');
+  setScanStatus('');
+}
+
 async function onReceiptFile(file) {
   if (!file) return;
   if (!/^image\//.test(file.type)) {
     setScanStatus('that\u2019s not an image \u2014 try a photo', 'error');
     return;
   }
+  // If the user is re-scanning, un-collapse first so the "reading..." copy
+  // is visible on the full-size button.
+  const row = $('scan-row');
+  if (row) row.classList.remove('filed');
+
   setScanButtonState('loading');
   setScanStatus('reading the receipt\u2026', 'active');
 
@@ -1132,7 +1031,9 @@ async function onReceiptFile(file) {
         slug: SLUG,
         image,
         prompt,
-        quality: 'pro',
+        // Fast tier — pulling a grand total off a receipt doesn't need the
+        // pro model, and the latency win matters at intake.
+        quality: 'fast',
         response_format: 'json_object'
       })
     });
@@ -1155,12 +1056,14 @@ async function onReceiptFile(file) {
     const input = $('bill-total');
     if (input) {
       input.value = total.toFixed(2);
-      // Let any input listeners (line count, validation) react.
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
     }
     setScanButtonState('idle');
-    setScanStatus('total read: $' + total.toFixed(2), '');
+    // Collapse the scan row into a small "filed" chip — the big button is
+    // no longer needed once the total is in.
+    collapseScanRow(total);
+    setScanStatus('');
   } catch (_) {
     setScanButtonState('idle');
     setScanStatus('couldn\u2019t reach the scanner \u2014 enter it manually', 'error');
@@ -1178,13 +1081,9 @@ function visionErrorCopy(status, code) {
 function wireReceiptScan() {
   const input = $('scan-input');
   if (!input) return;
-  // The input is layered transparently on top of .scan-btn, so taps land
-  // on it directly — no label forwarding, no programmatic .click(). This
-  // is the only scan-button pattern that's reliable across iOS Safari.
   input.addEventListener('change', () => {
     const file = input.files && input.files[0];
     onReceiptFile(file);
-    // Reset the input so picking the same file twice still fires `change`.
     try { input.value = ''; } catch (_) {}
   });
 }
@@ -1227,12 +1126,9 @@ document.addEventListener('DOMContentLoaded', () => {
     onReset();
   });
 
-  // Voice testimony — MediaRecorder → Whisper proxy.
   wireMic();
-  // Receipt photo intake — file picker → vision proxy.
   wireReceiptScan();
 
-  // Deep-link replay: render from fragment without any re-compute / LLM call.
   const frag = decodeFragment();
   if (frag) {
     const receipt = receiptFromFragment(frag);

@@ -160,6 +160,37 @@ body {
   border-style: solid;
 }
 
+/* Collapsed state: once the scan has filled in the bill total, replace the
+ * big dashed-border button with a compact confirmation pill. Keeps the
+ * input layered on top so the user can still tap to redo, but the button
+ * stops dominating the form. */
+.scan-row.filed .scan-btn {
+  border-style: solid;
+  border-color: var(--rule);
+  background: #fafaf7;
+  color: var(--ink-3);
+  font-size: 12px;
+  font-weight: 500;
+  min-height: 32px;
+  padding: 6px 12px;
+  gap: 8px;
+  border-radius: 999px;
+  box-shadow: none;
+}
+.scan-row.filed .scan-icon {
+  width: 12px; height: 10px;
+  border-width: 1.5px;
+}
+.scan-row.filed .scan-icon::before {
+  top: -4px; left: 3px;
+  width: 6px; height: 3px;
+  border-width: 1.5px;
+}
+.scan-row.filed .scan-icon::after {
+  top: 2px; left: 3px;
+  width: 3px; height: 3px;
+}
+
 /*
  * Transparent file input stacked over the visual .scan-btn. User taps the
  * input directly — no <label for>/nested-input forwarding, which was flaky
