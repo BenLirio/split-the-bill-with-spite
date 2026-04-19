@@ -31,7 +31,13 @@
         <div class="amount-row">
           <span class="dollar">$</span>
           <input id="bill-total" name="bill-total" type="text" inputmode="decimal" value="184.00" maxlength="8" autocomplete="off" spellcheck="false">
+          <button type="button" id="scan-btn" class="scan-btn" aria-label="snap a photo of the receipt">
+            <span class="scan-icon" aria-hidden="true"></span>
+            <span class="scan-label">snap receipt</span>
+          </button>
+          <input id="scan-input" class="visually-hidden" type="file" accept="image/*" capture="environment">
         </div>
+        <p id="scan-status" class="scan-status" aria-live="polite"></p>
 
         <label for="log" class="field-label">
           Who was there and what they did.
@@ -54,7 +60,7 @@
         <p id="intake-error" class="error hidden" aria-live="polite"></p>
 
         <button id="submit-btn" type="submit" class="primary-btn">Run the numbers</button>
-        <p class="disclaimer">The split sums to your stated bill total &mdash; spite just redistributes who pays what. Do not settle real debts with this. Voice never leaves your device.</p>
+        <p class="disclaimer">The split sums to your stated bill total &mdash; spite just redistributes who pays what. Do not settle real debts with this.</p>
       </form>
     </section>
 

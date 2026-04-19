@@ -18,9 +18,14 @@
 //   - Mobile-first, modern Venmo/Splitwise aesthetic.
 
 const AI_ENDPOINT = 'https://uy3l6suz07.execute-api.us-east-1.amazonaws.com/ai';
+const SPEECH_ENDPOINT = 'https://hwfpnikys5.execute-api.us-east-1.amazonaws.com/speech';
+const VISION_ENDPOINT = 'https://sm3y7y9t2a.execute-api.us-east-1.amazonaws.com/vision';
 const SLUG = 'split-the-bill-with-spite';
 const MIN_PEOPLE = 3;
 const MAX_PEOPLE = 6;
+
+// Upper-bound recording length so the audio blob never nears the 5MB/60s proxy cap.
+const MAX_RECORDING_MS = 45000;
 
 // ---------- util ----------
 
@@ -765,23 +770,25 @@ function onSample() {
   $('intake-error').classList.add('hidden');
 }
 
-// ---------- voice intake (Web Speech API) ----------
+// ---------- voice intake (MediaRecorder → Whisper proxy) ----------
 //
-// Tap the mic to start, tap again to stop. Transcription streams into the
-// textarea. Users can keep talking naturally — the parser will find the names
-// and split multi-person runs into per-person lines at submit time.
-// Completely optional; the text path always works. No backend calls — the
-// browser handles recognition locally (or via the platform's speech service
-// on Chrome/Edge).
+// Tap the mic to start, tap again to stop. When stopped, the recording is
+// POSTed to the factory's speech proxy (OpenAI Whisper) and the transcript
+// is appended to the textarea. Whisper is materially more accurate than the
+// browser's Web Speech API and works uniformly on Firefox/Safari/iOS/Android.
+// Text path always works as a fallback. Audio is sent to OpenAI for transcription.
 
-const SpeechRec = (typeof window !== 'undefined') &&
-  (window.SpeechRecognition || window.webkitSpeechRecognition);
+const hasMediaRecorder =
+  typeof window !== 'undefined' &&
+  !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) &&
+  typeof window.MediaRecorder !== 'undefined';
 
-let voice = null;          // active SpeechRecognition instance
-let voiceActive = false;
-let voiceStarting = false; // true from tap → onstart, for instant UI feedback
-let voiceAppendBase = '';  // textarea value when the current session started
-let voiceFinalChunks = []; // finalized transcript chunks for this session
+let mediaStream = null;
+let mediaRecorder = null;
+let voiceChunks = [];
+let voiceState = 'idle';      // 'idle' | 'starting' | 'listening' | 'transcribing'
+let voiceStopTimer = null;
+let voiceBaseText = '';       // textarea value at the start of the current session
 
 function setMicStatus(text, cls) {
   const el = $('mic-status');
@@ -791,47 +798,12 @@ function setMicStatus(text, cls) {
   if (cls) el.classList.add(cls);
 }
 
-function normalizeUtterance(s) {
-  // Convert common spoken punctuation to symbols, drop trailing "period".
-  let out = String(s || '').trim();
-  if (!out) return out;
-  out = out
-    .replace(/\s+(new line|newline)\s*/gi, '\n')
-    .replace(/\s+period\.?$/i, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return out;
-}
-
-function buildVoiceTextarea(interim) {
-  const finals = voiceFinalChunks.map(normalizeUtterance).filter(Boolean);
-  const parts = [voiceAppendBase.replace(/\s+$/, '')];
-  if (finals.length) {
-    // Join utterances with a single space — the name-aware parser can split
-    // a run-on paragraph into per-person records, so we don't need to force
-    // newlines between utterances.
-    parts.push(finals.join(' '));
-  }
-  let text = parts.filter(Boolean).join('\n');
-  if (interim) {
-    text = (text ? text + ' ' : '') + normalizeUtterance(interim);
-  }
-  return text;
-}
-
-function writeVoiceToTextarea(interim) {
-  const ta = $('log');
-  if (!ta) return;
-  ta.value = buildVoiceTextarea(interim);
-  updateLineCount();
-}
-
 function setMicButtonState(state) {
-  // state: 'idle' | 'starting' | 'listening'
+  voiceState = state;
   const btn = $('mic-btn');
   if (!btn) return;
   const lbl = btn.querySelector('.mic-label');
-  btn.classList.remove('starting', 'listening');
+  btn.classList.remove('starting', 'listening', 'transcribing');
   if (state === 'starting') {
     btn.classList.add('starting');
     btn.setAttribute('aria-pressed', 'true');
@@ -840,123 +812,201 @@ function setMicButtonState(state) {
     btn.classList.add('listening');
     btn.setAttribute('aria-pressed', 'true');
     if (lbl) lbl.textContent = 'listening\u2026 tap to stop';
+  } else if (state === 'transcribing') {
+    btn.classList.add('transcribing');
+    btn.setAttribute('aria-pressed', 'true');
+    btn.disabled = true;
+    if (lbl) lbl.textContent = 'transcribing\u2026';
   } else {
     btn.setAttribute('aria-pressed', 'false');
+    btn.disabled = false;
     if (lbl) lbl.textContent = 'tap to testify';
   }
 }
 
-function startVoice() {
-  if (!SpeechRec) {
-    setMicStatus('this browser can\u2019t listen \u2014 type it instead', 'error');
+function pickAudioMime() {
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',           // Safari
+    'audio/ogg;codecs=opus'
+  ];
+  if (window.MediaRecorder && MediaRecorder.isTypeSupported) {
+    for (const t of candidates) if (MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
+async function startVoice() {
+  if (voiceState !== 'idle') return;
+  if (!hasMediaRecorder) {
+    setMicStatus('this browser can\u2019t record \u2014 type it instead', 'error');
     return;
   }
-  if (voiceActive || voiceStarting) return;
-  voiceStarting = true;
-  // Immediate visual feedback — don't wait for onstart (which can take a
-  // beat while the browser prompts for mic permission).
   setMicButtonState('starting');
   setMicStatus('opening mic\u2026', 'active');
 
   try {
-    voice = new SpeechRec();
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    setMicButtonState('idle');
+    const msg = (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError'))
+      ? 'mic blocked by the browser \u2014 allow it or type'
+      : 'no mic detected \u2014 type it instead';
+    setMicStatus(msg, 'error');
+    return;
+  }
+
+  const mimeType = pickAudioMime();
+  try {
+    mediaRecorder = mimeType ? new MediaRecorder(mediaStream, { mimeType }) : new MediaRecorder(mediaStream);
   } catch (_) {
-    voiceStarting = false;
+    cleanupStream();
     setMicButtonState('idle');
     setMicStatus('mic unavailable \u2014 type it instead', 'error');
     return;
   }
-  voice.continuous = true;
-  voice.interimResults = true;
-  voice.lang = (navigator.language && navigator.language.startsWith('en')) ? navigator.language : 'en-US';
-  voice.maxAlternatives = 1;
 
+  voiceChunks = [];
   const ta = $('log');
-  voiceAppendBase = (ta && ta.value) ? (ta.value.replace(/\s+$/, '') + (ta.value.trim() ? '\n' : '')) : '';
-  voiceFinalChunks = [];
+  voiceBaseText = ta ? ta.value : '';
 
-  voice.onstart = () => {
-    voiceActive = true;
-    voiceStarting = false;
+  mediaRecorder.ondataavailable = (ev) => {
+    if (ev.data && ev.data.size > 0) voiceChunks.push(ev.data);
+  };
+  mediaRecorder.onstart = () => {
     setMicButtonState('listening');
     setMicStatus('listening\u2026 say everyone\u2019s names and what they did', 'active');
+    // Safety cap — don't let a forgotten-on mic blow through the 5MB proxy limit.
+    voiceStopTimer = setTimeout(() => {
+      try { if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop(); } catch (_) {}
+    }, MAX_RECORDING_MS);
   };
-
-  voice.onresult = (ev) => {
-    let interim = '';
-    for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const r = ev.results[i];
-      const txt = r[0] && r[0].transcript ? r[0].transcript : '';
-      if (r.isFinal) {
-        if (txt.trim()) voiceFinalChunks.push(txt.trim());
-      } else {
-        interim += txt;
-      }
-    }
-    writeVoiceToTextarea(interim);
-  };
-
-  voice.onerror = (ev) => {
-    const err = (ev && ev.error) || 'error';
-    let msg = 'mic error \u2014 type it instead';
-    if (err === 'not-allowed' || err === 'service-not-allowed') msg = 'mic blocked by the browser \u2014 allow it or type';
-    else if (err === 'no-speech') msg = 'didn\u2019t catch that \u2014 try again';
-    else if (err === 'audio-capture') msg = 'no mic detected \u2014 type it instead';
-    setMicStatus(msg, 'error');
-  };
-
-  voice.onend = () => {
-    voiceActive = false;
-    voiceStarting = false;
+  mediaRecorder.onerror = () => {
+    cleanupStream();
     setMicButtonState('idle');
-    // Finalize: write with no interim so the textarea ends clean.
-    writeVoiceToTextarea('');
-    if (!voiceFinalChunks.length) {
-      const el = $('mic-status');
-      if (el && !el.classList.contains('error')) setMicStatus('');
-    } else {
+    setMicStatus('mic error \u2014 type it instead', 'error');
+  };
+  mediaRecorder.onstop = async () => {
+    if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
+    const blobType = (mediaRecorder && mediaRecorder.mimeType) || mimeType || 'audio/webm';
+    const blob = new Blob(voiceChunks, { type: blobType });
+    voiceChunks = [];
+    cleanupStream();
+
+    if (blob.size < 500) {
+      setMicButtonState('idle');
+      setMicStatus('didn\u2019t catch that \u2014 try again', 'error');
+      return;
+    }
+
+    setMicButtonState('transcribing');
+    setMicStatus('transcribing\u2026', 'active');
+
+    try {
+      const dataUrl = await blobToDataURL(blob);
+      const res = await fetch(SPEECH_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug: SLUG, audio: dataUrl, language: 'en' })
+      });
+      if (!res.ok) {
+        let errBody = null;
+        try { errBody = await res.json(); } catch (_) {}
+        setMicButtonState('idle');
+        setMicStatus(speechErrorCopy(res.status, errBody && errBody.error), 'error');
+        return;
+      }
+      const { text } = await res.json();
+      const out = (text || '').trim();
+      if (!out) {
+        setMicButtonState('idle');
+        setMicStatus('didn\u2019t catch that \u2014 try again', 'error');
+        return;
+      }
+      appendVoiceText(out);
+      setMicButtonState('idle');
       const parsedCount = parseLog(($('log') || {}).value || '').length;
       setMicStatus('filed ' + parsedCount + ' diner' + (parsedCount === 1 ? '' : 's') + ' into the record', '');
+    } catch (_) {
+      setMicButtonState('idle');
+      setMicStatus('transcription failed \u2014 try again or type', 'error');
     }
-    voice = null;
   };
 
-  try { voice.start(); } catch (_) { /* onend will fire */ }
+  try { mediaRecorder.start(); }
+  catch (_) {
+    cleanupStream();
+    setMicButtonState('idle');
+    setMicStatus('mic unavailable \u2014 type it instead', 'error');
+  }
 }
 
 function stopVoice() {
-  if (voiceStarting && voice) {
-    // User tapped again before onstart fired — abort.
-    try { voice.abort && voice.abort(); } catch (_) {}
-    try { voice.stop(); } catch (_) {}
-    voiceStarting = false;
-    setMicButtonState('idle');
+  if (voiceState === 'listening' && mediaRecorder && mediaRecorder.state === 'recording') {
+    try { mediaRecorder.stop(); } catch (_) {}
     return;
   }
-  if (!voiceActive || !voice) return;
-  try { voice.stop(); } catch (_) {}
+  if (voiceState === 'starting') {
+    // Bail out before the recorder started capturing.
+    cleanupStream();
+    setMicButtonState('idle');
+    setMicStatus('');
+  }
 }
 
 function toggleVoice() {
-  if (voiceActive || voiceStarting) stopVoice(); else startVoice();
+  if (voiceState === 'idle') startVoice();
+  else if (voiceState === 'listening' || voiceState === 'starting') stopVoice();
+  // 'transcribing' is a no-op — button is disabled during the POST.
 }
 
-// Simple tap-to-toggle. Instant visual feedback on pointerdown so the button
-// never feels laggy (previous press-and-hold semantics felt unresponsive on
-// touch devices where pointerup lagged behind the finger lift).
+function cleanupStream() {
+  if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
+  if (mediaStream) {
+    try { mediaStream.getTracks().forEach(t => t.stop()); } catch (_) {}
+    mediaStream = null;
+  }
+  mediaRecorder = null;
+}
+
+function appendVoiceText(text) {
+  const ta = $('log');
+  if (!ta) return;
+  const base = (voiceBaseText || '').replace(/\s+$/, '');
+  const sep = base ? '\n' : '';
+  ta.value = base + sep + text;
+  updateLineCount();
+}
+
+function speechErrorCopy(status, code) {
+  if (status === 429 && code === 'daily_cap_reached') return 'voice maxed out for today \u2014 type it instead';
+  if (status === 429) return 'too many requests \u2014 wait a minute, then try again';
+  if (code === 'audio_too_large') return 'that ran long \u2014 keep it under 45 seconds';
+  if (code === 'audio_too_small') return 'didn\u2019t catch that \u2014 try again';
+  return 'transcription failed \u2014 try again or type';
+}
+
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+
 function wireMic() {
   const btn = $('mic-btn');
   if (!btn) return;
-  if (!SpeechRec) {
+  if (!hasMediaRecorder) {
     btn.disabled = true;
     const lbl = btn.querySelector('.mic-label');
     if (lbl) lbl.textContent = 'voice unavailable';
-    setMicStatus('voice input needs Chrome, Edge, or Safari', '');
+    setMicStatus('voice input needs a modern browser with mic access', '');
     return;
   }
 
-  // Use click for toggle. pointerdown adds a pressed visual so touch users
-  // get instant feedback even before click fires.
   btn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     btn.classList.add('tapping');
@@ -977,6 +1027,156 @@ function wireMic() {
       e.preventDefault();
       toggleVoice();
     }
+  });
+}
+
+// ---------- receipt photo intake (vision proxy) ----------
+//
+// User snaps / uploads a photo of the physical receipt; we downscale client-side,
+// POST to the vision proxy, and fill the bill-total input with the extracted total.
+
+const RECEIPT_MAX_EDGE = 1280;
+const RECEIPT_JPEG_QUALITY = 0.82;
+
+async function fileToScaledJpegDataURL(file) {
+  // Decode with createImageBitmap when available (handles HEIC on iOS, faster).
+  let bitmap = null;
+  try {
+    if (typeof createImageBitmap === 'function') {
+      bitmap = await createImageBitmap(file);
+    }
+  } catch (_) {}
+  let srcW, srcH, drawable;
+  if (bitmap) {
+    srcW = bitmap.width; srcH = bitmap.height; drawable = bitmap;
+  } else {
+    const url = URL.createObjectURL(file);
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = reject;
+      i.src = url;
+    });
+    srcW = img.naturalWidth; srcH = img.naturalHeight; drawable = img;
+  }
+  const scale = Math.min(1, RECEIPT_MAX_EDGE / Math.max(srcW, srcH));
+  const w = Math.max(1, Math.round(srcW * scale));
+  const h = Math.max(1, Math.round(srcH * scale));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(drawable, 0, 0, w, h);
+  return c.toDataURL('image/jpeg', RECEIPT_JPEG_QUALITY);
+}
+
+function setScanStatus(text, cls) {
+  const el = $('scan-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.remove('active', 'error');
+  if (cls) el.classList.add(cls);
+}
+
+function setScanButtonState(state) {
+  const btn = $('scan-btn');
+  if (!btn) return;
+  const lbl = btn.querySelector('.scan-label');
+  btn.classList.remove('loading');
+  if (state === 'loading') {
+    btn.classList.add('loading');
+    btn.disabled = true;
+    if (lbl) lbl.textContent = 'reading\u2026';
+  } else {
+    btn.disabled = false;
+    if (lbl) lbl.textContent = 'snap receipt';
+  }
+}
+
+async function onReceiptFile(file) {
+  if (!file) return;
+  if (!/^image\//.test(file.type)) {
+    setScanStatus('that\u2019s not an image \u2014 try a photo', 'error');
+    return;
+  }
+  setScanButtonState('loading');
+  setScanStatus('reading the receipt\u2026', 'active');
+
+  let image;
+  try {
+    image = await fileToScaledJpegDataURL(file);
+  } catch (_) {
+    setScanButtonState('idle');
+    setScanStatus('couldn\u2019t read that image \u2014 try another', 'error');
+    return;
+  }
+
+  const prompt =
+    'You are looking at a photo. If it is a restaurant / cafe / bar receipt, find the FINAL TOTAL — the grand total the customer owed, after tax and tip if they are printed. If tip is not printed, use the total before tip. Return strict JSON only: ' +
+    '{"total": <number, decimal dollars, e.g. 45.23>, "found": <true|false>, "reason": <short string>}. ' +
+    'Set "found": false (and total: 0) if it is not a receipt, or if the total cannot be read with confidence. No prose outside the JSON.';
+
+  try {
+    const res = await fetch(VISION_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        slug: SLUG,
+        image,
+        prompt,
+        quality: 'pro',
+        response_format: 'json_object'
+      })
+    });
+    if (!res.ok) {
+      let errBody = null;
+      try { errBody = await res.json(); } catch (_) {}
+      setScanButtonState('idle');
+      setScanStatus(visionErrorCopy(res.status, errBody && errBody.error), 'error');
+      return;
+    }
+    const body = await res.json();
+    let parsed = null;
+    try { parsed = JSON.parse(body.text); } catch (_) {}
+    if (!parsed || parsed.found !== true || typeof parsed.total !== 'number' || !(parsed.total > 0)) {
+      setScanButtonState('idle');
+      setScanStatus('couldn\u2019t find a total on that \u2014 enter it manually', 'error');
+      return;
+    }
+    const total = Math.round(parsed.total * 100) / 100;
+    const input = $('bill-total');
+    if (input) {
+      input.value = total.toFixed(2);
+      // Let any input listeners (line count, validation) react.
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    setScanButtonState('idle');
+    setScanStatus('total read: $' + total.toFixed(2), '');
+  } catch (_) {
+    setScanButtonState('idle');
+    setScanStatus('couldn\u2019t reach the scanner \u2014 enter it manually', 'error');
+  }
+}
+
+function visionErrorCopy(status, code) {
+  if (status === 429 && code === 'daily_cap_reached') return 'scanner maxed out for today \u2014 enter it manually';
+  if (status === 429) return 'too many requests \u2014 wait a minute, then try again';
+  if (code === 'image_too_large') return 'image too big \u2014 try a smaller photo';
+  if (code === 'bad_image' || code === 'bad_image_type') return 'couldn\u2019t read that image \u2014 try another';
+  return 'scanner glitched \u2014 enter it manually';
+}
+
+function wireReceiptScan() {
+  const btn = $('scan-btn');
+  const input = $('scan-input');
+  if (!btn || !input) return;
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    input.value = '';
+    input.click();
+  });
+  input.addEventListener('change', () => {
+    const file = input.files && input.files[0];
+    onReceiptFile(file);
   });
 }
 
@@ -1018,8 +1218,10 @@ document.addEventListener('DOMContentLoaded', () => {
     onReset();
   });
 
-  // Voice testimony — Web Speech API (client-side, no backend).
+  // Voice testimony — MediaRecorder → Whisper proxy.
   wireMic();
+  // Receipt photo intake — file picker → vision proxy.
+  wireReceiptScan();
 
   // Deep-link replay: render from fragment without any re-compute / LLM call.
   const frag = decodeFragment();
