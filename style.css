@@ -657,8 +657,19 @@ body {
   touch-action: manipulation;
 }
 .mic-btn:hover { background: var(--ink); color: #fff; }
-.mic-btn:active { transform: translateY(1px); }
-.mic-btn[aria-pressed="true"] {
+.mic-btn:active,
+.mic-btn.tapping {
+  transform: translateY(1px);
+  background: var(--ink);
+  color: #fff;
+}
+.mic-btn.starting {
+  background: #555;
+  color: #fff;
+  border-color: #555;
+}
+.mic-btn[aria-pressed="true"],
+.mic-btn.listening {
   background: var(--accent);
   color: #fff;
   border-color: var(--accent);
@@ -673,8 +684,12 @@ body {
   background: var(--accent);
   display: inline-block;
   flex: 0 0 auto;
+  transition: background .15s ease;
 }
-.mic-btn[aria-pressed="true"] .mic-dot {
+.mic-btn.tapping .mic-dot,
+.mic-btn.starting .mic-dot { background: #fff; }
+.mic-btn[aria-pressed="true"] .mic-dot,
+.mic-btn.listening .mic-dot {
   background: #fff;
   animation: pulse 1s infinite ease-in-out;
 }

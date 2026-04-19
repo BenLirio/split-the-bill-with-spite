@@ -1,28 +1,26 @@
-// Split the Bill With Spite — paste 3-6 diners + what they did at dinner; return
-// a spite-adjusted itemized receipt.
+// Split the Bill With Spite — enter the actual receipt total + what each diner did;
+// return a spite-adjusted itemized receipt. Per-person amounts SUM to the stated
+// bill — spite just redistributes who pays more and who pays less.
 //
-// Design decisions (per KB + skill rules):
-//   - SINGLE paste-all textarea for intake. One line per person, format:
-//       "<name> <free-form description of what they did>"
-//     First whitespace-separated token is the name; the rest is behavior.
-//   - Deterministic core logic (verdict picks, spite deltas, totals) — seeded
+// Design decisions (per KB + feedback triage):
+//   - One textarea, but parsing is smart: accepts either (a) one person per line
+//     OR (b) multiple people in one run-on paragraph. A name-detector splits
+//     run-on text into per-person records.
+//   - Deterministic core logic (verdict picks, spite weights, totals) — seeded
 //     off a hash of the input so the same paste always yields the same receipt.
+//   - TOTAL-PRESERVING: the per-person amounts always sum to the stated bill.
+//     Spite multipliers bias a weighted split — they don't tack on a surplus.
 //   - Optional LLM flourish per person (one snappy quoted line-item quip).
 //     Temperature 0, response_format=json_object. Deterministic fallback if the
 //     call fails, times out, or returns garbage.
 //   - Final state is encoded into location.hash so a shared link re-renders the
-//     exact same receipt without any LLM call or recompute. Re-hydration is the
-//     only code path reading the fragment; never re-decides verdicts.
-//   - Mobile-first, modern Venmo/Splitwise aesthetic. No retro typewriter.
+//     exact same receipt without any LLM call or recompute.
+//   - Mobile-first, modern Venmo/Splitwise aesthetic.
 
 const AI_ENDPOINT = 'https://uy3l6suz07.execute-api.us-east-1.amazonaws.com/ai';
 const SLUG = 'split-the-bill-with-spite';
 const MIN_PEOPLE = 3;
 const MAX_PEOPLE = 6;
-
-// In-memory photo of the tab (data URL). Client-side only — never uploaded.
-// Intentionally not encoded into the share URL fragment (would blow up link size).
-let tabPhotoDataUrl = null;
 
 // ---------- util ----------
 
@@ -92,9 +90,11 @@ function b64urlDecode(s) {
 // ---------- verdict catalog ----------
 //
 // Every verdict is a self-contained archetype label + a spite multiplier in
-// [min, max] cents-on-the-dollar relative to their fair share. Positive values
-// charge the person more; negative values refund them. Deterministic pick by
-// keyword match against their description, then seeded fallback.
+// [min, max] relative to their fair share. Positive values skew them toward
+// paying MORE of the bill; negative values toward paying less. Totals always
+// sum to the stated bill — multipliers are applied to a weighted split, not
+// added on top. Deterministic pick by keyword match against their description,
+// then seeded fallback.
 
 const VERDICTS = [
   { name: 'The Lobster Heiress',          mult: [0.25, 0.55],  tags: ['lobster','steak','ribeye','wagyu','oyster','truffle','caviar','tasting menu','market price'] },
@@ -158,17 +158,120 @@ function pickVerdict(name, behaviorText, seed) {
 }
 
 // ---------- parsing + totals ----------
+//
+// Smart parsing: accepts either one-person-per-line OR a run-on paragraph with
+// multiple people. We detect capitalized-name boundaries to re-segment a run-on
+// block. Voice dictation often produces one long sentence — we refuse to make
+// the user babysit "one line per person".
+
+// Common filler words that happen to be capitalized at sentence starts; we do
+// NOT want to treat these as a new diner.
+const NAME_STOPWORDS = new Set([
+  'then','and','but','also','while','meanwhile','okay','ok','so','then,','also,',
+  'plus','next','after','before','then.','after.','later','finally','i',"i'll","i'd",'me','my',
+  'we','they','he','she','it','the','a','an','this','that','these','those',
+  'meanwhile,', 'meanwhile.', 'and,', 'but,', 'so,',
+]);
+
+function looksLikeName(token) {
+  if (!token) return false;
+  // Strip punctuation.
+  const clean = token.replace(/[^A-Za-z'\-]/g, '');
+  if (!clean) return false;
+  if (clean.length < 2 || clean.length > 20) return false;
+  // Must start with uppercase and have at least one more lowercase (rejects
+  // "I", "OK", "NYC" etc.).
+  if (clean[0] !== clean[0].toUpperCase()) return false;
+  if (!/[a-z]/.test(clean.slice(1))) return false;
+  if (NAME_STOPWORDS.has(clean.toLowerCase())) return false;
+  return true;
+}
+
+// Given a single run-on line like "Ben ordered the lobster. Sarah forgot her
+// wallet. Kai talked about crypto.", return an array of per-person strings.
+// If we can't confidently split, return the whole line as one entry.
+function splitRunOnLine(line) {
+  if (!line) return [];
+  // First try sentence-level splits (.?!).
+  const sentenceParts = line
+    .split(/(?<=[.!?])\s+(?=[A-Z])/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  // Start from sentences, then try to detect within-sentence name boundaries
+  // for very long sentences that forgot their periods.
+  const results = [];
+  for (const seg of sentenceParts) {
+    const split = splitBySecondaryNames(seg);
+    if (split.length > 1) {
+      for (const s of split) if (s.trim()) results.push(s.trim());
+    } else {
+      results.push(seg.trim());
+    }
+  }
+  // Only accept the split if at least 2 candidate names emerged AND the first
+  // token of each candidate looks like a name. Otherwise, fall back to the
+  // whole line.
+  const nameLike = results.filter(r => {
+    const first = r.split(/\s+/)[0] || '';
+    return looksLikeName(first);
+  });
+  if (nameLike.length >= 2) return results;
+  // Otherwise the line is probably a single person; keep as-is.
+  return [line.trim()];
+}
+
+// Within a single sentence, split at capitalized-name boundaries that are
+// preceded by a conjunction/connector or a comma/"then". Conservative: only
+// splits if the boundary candidate starts a new capitalized word that isn't
+// a stopword.
+function splitBySecondaryNames(sentence) {
+  // Candidate boundaries: ", Name " or " then Name " or " and Name " or " meanwhile Name ".
+  const boundaries = [];
+  const re = /(?:,\s*|\s+(?:then|and|but|so|meanwhile|plus|also|next)\s+)([A-Z][a-z'\-]+)\b/g;
+  let m;
+  while ((m = re.exec(sentence)) !== null) {
+    const nameIdx = m.index + m[0].indexOf(m[1]);
+    // Skip if this "name" is actually a stopword.
+    if (NAME_STOPWORDS.has(m[1].toLowerCase())) continue;
+    boundaries.push(nameIdx);
+  }
+  if (!boundaries.length) return [sentence];
+  const out = [];
+  let prev = 0;
+  for (const idx of boundaries) {
+    out.push(sentence.slice(prev, idx));
+    prev = idx;
+  }
+  out.push(sentence.slice(prev));
+  return out;
+}
 
 function parseLog(raw) {
-  // Returns list of { name, behavior } — first token is the name, rest is text.
-  const lines = String(raw || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  const out = [];
+  // Returns list of { name, behavior }.
+  // Accept both "one person per line" AND a single run-on paragraph with
+  // multiple people. We split the raw text on newlines first, then apply
+  // smart sentence-splitting to any line that contains multiple name-like
+  // boundaries.
+  const lines = String(raw || '')
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const expanded = [];
   for (const line of lines) {
+    const parts = splitRunOnLine(line);
+    for (const p of parts) if (p.trim()) expanded.push(p.trim());
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const rawEntry of expanded) {
     // Remove leading bullets/dashes.
-    const cleaned = line.replace(/^[-*\u2022]\s*/, '').trim();
+    const cleaned = rawEntry.replace(/^[-*\u2022]\s*/, '').trim();
     if (!cleaned) continue;
 
-    // Split on first separator: em-dash, en-dash, colon, comma, or whitespace.
+    // Primary: explicit separator between name and behavior.
     let m = cleaned.match(/^([A-Za-z][\w.'\-]*)\s*[\u2014\u2013:,\-]\s*(.+)$/);
     let name, behavior;
     if (m) {
@@ -181,9 +284,26 @@ function parseLog(raw) {
       behavior = parts.slice(1).join(' ').trim();
     }
     if (!name) continue;
+    // If the "name" looks like it isn't actually a name (lowercase word from a
+    // mid-sentence fragment), skip the entry rather than emit a bogus diner.
+    if (!looksLikeName(name)) continue;
     if (!behavior) behavior = '(no notes)';
-    // Clean up trailing period on the whole behavior string so quoting looks neat.
-    behavior = behavior.replace(/\s+/g, ' ').replace(/[.,;]+$/, '').trim();
+    // Clean up stray leading connector words that survived the split (e.g.
+    // "then Sarah forgot her wallet" → name=Sarah, behavior leftover "forgot...").
+    behavior = behavior.replace(/^(then|and|but|so|meanwhile|plus|also|next)\s+/i, '');
+    // Clean up trailing separators/conjunctions and punctuation.
+    behavior = behavior
+      .replace(/\s+/g, ' ')
+      .replace(/[.,;]+$/, '')
+      .replace(/\s+(then|and|but|so|meanwhile|plus|also|next)\s*$/i, '')
+      .trim();
+
+    // Dedupe by normalized name (voice dictation sometimes emits the same
+    // sentence twice). Keep the first occurrence.
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
     out.push({ name, behavior });
   }
   return out;
@@ -194,7 +314,7 @@ function validateInput(bill, people) {
     return 'bill total needs to be a number between $1 and $99,999.';
   }
   if (people.length < MIN_PEOPLE) {
-    return `we need at least ${MIN_PEOPLE} people on this receipt. add a line per person.`;
+    return `we need at least ${MIN_PEOPLE} diners. name a few more people and what they did.`;
   }
   if (people.length > MAX_PEOPLE) {
     return `max ${MAX_PEOPLE} people per receipt — the pettiness doesn't scale past six.`;
@@ -202,16 +322,21 @@ function validateInput(bill, people) {
   return null;
 }
 
-// ---------- core computation (deterministic) ----------
+// ---------- core computation (deterministic, total-preserving) ----------
+//
+// Strategy: each person starts with weight 1. Apply their spite multiplier to
+// get a biased weight (1 + mult). Normalize weights to sum to 1, then multiply
+// by the stated bill. This guarantees sum(amounts) === bill exactly (to cents,
+// after a final rounding pass that reconciles any half-cent drift into the
+// last person). Per-person spite delta = amount_owed − fair_share.
 
 function computeReceipt(bill, people) {
   const fullInput = JSON.stringify({ b: bill.toFixed(2), p: people });
   const seed = hash(fullInput);
-  const rand = mulberry32(seed);
 
   const fairShare = bill / people.length;
 
-  // Per-person: pick verdict, compute deltas deterministically.
+  // Per-person: pick verdict, compute weights deterministically.
   const draft = people.map((p, i) => {
     const localSeed = hash(p.name + '|' + p.behavior + '|' + i);
     const verdict = pickVerdict(p.name, p.behavior, localSeed);
@@ -219,35 +344,68 @@ function computeReceipt(bill, people) {
     // Spite multiplier: interpolate deterministically between mult[0] and mult[1].
     const r = mulberry32(localSeed)();
     const mult = verdict.mult[0] + (verdict.mult[1] - verdict.mult[0]) * r;
-    const spiteDelta = fairShare * mult;
+    // Clamp to a sane weight range so no one gets a zero share.
+    const weight = Math.max(0.2, 1 + mult);
 
     return {
       name: p.name,
       behavior: p.behavior,
-      fair_share: fairShare,
-      spite_delta: spiteDelta,
       verdict: verdict.name,
+      mult,
+      weight,
       is_spicy: Math.abs(mult) >= 0.2,
-      line_items: buildLocalLineItems(p, verdict, spiteDelta, fairShare, localSeed),
+      localSeed,
     };
   });
 
-  // Zero-sum across the group so the stated bill still equals sum(amounts)
-  // EXCEPT that we intentionally *add* a spite surplus — the whole joke is that
-  // the new total is > stated. We add deltas directly and surface the surplus.
-  const totalSpite = draft.reduce((s, p) => s + p.spite_delta, 0);
-  const newTotal = bill + totalSpite;
+  // Normalize weights so their sum == bill.
+  const weightSum = draft.reduce((s, d) => s + d.weight, 0);
+  // Cents-accurate allocation: compute each cent amount, track rounding residue.
+  const billCents = Math.round(bill * 100);
+  let allocated = 0;
+  const amountsCents = draft.map((d, i) => {
+    if (i === draft.length - 1) {
+      // Last person absorbs the rounding residue so the sum equals the bill exactly.
+      return billCents - allocated;
+    }
+    const share = (d.weight / weightSum) * billCents;
+    const c = Math.round(share);
+    allocated += c;
+    return c;
+  });
 
-  const results = draft.map(p => ({
-    ...p,
-    amount_owed: Math.max(0, p.fair_share + p.spite_delta),
-  }));
+  const results = draft.map((d, i) => {
+    const amount_owed = amountsCents[i] / 100;
+    const spite_delta = amount_owed - fairShare;
+    return {
+      name: d.name,
+      behavior: d.behavior,
+      fair_share: fairShare,
+      spite_delta,
+      verdict: d.verdict,
+      is_spicy: d.is_spicy,
+      amount_owed,
+      line_items: buildLocalLineItems(
+        { name: d.name, behavior: d.behavior },
+        { name: d.verdict },
+        spite_delta,
+        fairShare,
+        d.localSeed
+      ),
+    };
+  });
+
+  // Redistribution magnitude = sum of positive deltas (equals abs(sum of negatives)).
+  const spiteRedistribution = results.reduce(
+    (s, p) => s + Math.max(0, p.spite_delta),
+    0
+  );
 
   return {
     bill,
     fair_share: fairShare,
-    spite_surplus: totalSpite,
-    new_total: newTotal,
+    spite_redistribution: spiteRedistribution,
+    new_total: bill,  // total-preserving: always equals stated bill
     people: results,
     seed,
     receipt_id: receiptIdFromSeed(seed),
@@ -256,9 +414,9 @@ function computeReceipt(bill, people) {
   };
 }
 
-// Locally-composed line-items: one snarky quote of the person's own line, one
-// spite adjustment, one friendly share label. These are replaced by the LLM
-// flourish when it succeeds.
+// Locally-composed line-items: one "share of dinner" at fair-share, one spite
+// adjustment (the delta from fair-share). These sum to amount_owed, and across
+// all diners sum to the stated bill.
 function buildLocalLineItems(person, verdict, spiteDelta, fairShare, localSeed) {
   const quipBank = [
     (b) => `"${b}" — surcharge`,
@@ -367,15 +525,14 @@ async function tryLLMFlourish(receipt) {
   }
 }
 
-// Apply the LLM quip into the first "quote" line-item for each person, keeping
-// the spite-delta dollar amount intact.
+// Apply the LLM quip into the "quote" line-item for each person, keeping the
+// spite-delta dollar amount intact.
 function applyFlourish(receipt, map) {
   if (!map) return receipt;
   const out = { ...receipt, _source: 'ai', people: receipt.people.map((p, i) => {
     const quip = map[i];
     if (!quip) return p;
     const items = p.line_items.slice();
-    // Replace the "quote" line-item (index 1) description but keep the amount.
     if (items[1]) {
       items[1] = { ...items[1], desc: quip };
     }
@@ -388,18 +545,11 @@ function applyFlourish(receipt, map) {
 //
 // Shape:
 //   #r=<base64url of { b: billCents, d: [ { n, v, a, q } ] }>
-// where each entry has:
-//   n: name
-//   v: verdict
-//   a: amount owed (cents, integer)
-//   q: per-person quip line (the flourish item text)
-// plus a short optional behavior echo so the share link is self-describing.
 // Re-hydration reconstructs fair_share and spite_delta from amount+bill/count.
 
 function encodeReceiptToFragment(receipt) {
   const payload = {
     b: Math.round(receipt.bill * 100),
-    n: receipt.new_total ? Math.round(receipt.new_total * 100) : null,
     d: receipt.people.map(p => ({
       n: p.name,
       b: p.behavior,
@@ -443,13 +593,19 @@ function receiptFromFragment(obj) {
       ],
     };
   });
+  const spiteRedistribution = people.reduce(
+    (s, p) => s + Math.max(0, p.spite_delta),
+    0
+  );
+  // Use the sum of encoded amounts as the authoritative total so that old
+  // additive-model share links still render a coherent receipt (total matches
+  // per-person sum). New links sum to the stated bill by construction.
   const totalOwed = people.reduce((s, p) => s + p.amount_owed, 0);
-  const newTotal = obj.n != null ? obj.n / 100 : totalOwed;
   return {
     bill,
     fair_share: fairShare,
-    spite_surplus: newTotal - bill,
-    new_total: newTotal,
+    spite_redistribution: spiteRedistribution,
+    new_total: totalOwed,
     people,
     seed: 0,
     receipt_id: String(obj.id || '').slice(0, 16) || 'RCPT-000000',
@@ -486,19 +642,6 @@ function renderReceipt(receipt) {
   $('receipt-date').textContent = receipt.date;
   $('receipt-id').textContent = receipt.receipt_id;
   $('foot-id').textContent = `${receipt.receipt_id} · filed ${receipt.date}`;
-
-  // Attach the tab photo as "Exhibit A" if the user supplied one this session.
-  const exhibitEl = $('exhibit');
-  const exhibitImg = $('exhibit-img');
-  if (exhibitEl && exhibitImg) {
-    if (tabPhotoDataUrl) {
-      exhibitImg.src = tabPhotoDataUrl;
-      exhibitEl.classList.remove('hidden');
-    } else {
-      exhibitImg.removeAttribute('src');
-      exhibitEl.classList.add('hidden');
-    }
-  }
 
   const container = $('people');
   container.innerHTML = '';
@@ -543,7 +686,9 @@ function renderReceipt(receipt) {
   });
 
   $('bill-stated').textContent = fmtMoney(receipt.bill);
-  $('spite-adj').textContent = fmtMoneyDelta(receipt.spite_surplus);
+  // Redistribution magnitude, shown as ±$X — spite moves X dollars from the
+  // innocents to the guilty, but total paid stays equal to the stated bill.
+  $('spite-adj').textContent = '\u00B1' + fmtMoney(receipt.spite_redistribution);
   $('bill-total-out').textContent = fmtMoney(receipt.new_total);
 
   showScreen('result');
@@ -597,7 +742,6 @@ function onReset() {
   history.replaceState(null, '', location.pathname + location.search);
   $('log').value = '';
   $('bill-total').value = '184.00';
-  clearTabPhoto();
   stopVoice();
   updateLineCount();
   $('intake-error').classList.add('hidden');
@@ -607,11 +751,11 @@ function onReset() {
 }
 
 const SAMPLE = [
-  'Ben ordered the lobster and a second lobster',
+  'Ben ordered the lobster and a second lobster.',
   'Sarah forgot her wallet. again.',
-  'Kai talked about crypto for 40 minutes',
-  'Priya ordered water and judged everyone',
-  'Marcus split an appetizer and called it dinner',
+  'Kai talked about crypto for 40 minutes.',
+  'Priya ordered water and judged everyone.',
+  'Marcus split an appetizer and called it dinner.',
 ].join('\n');
 
 function onSample() {
@@ -621,124 +765,21 @@ function onSample() {
   $('intake-error').classList.add('hidden');
 }
 
-// ---------- tab photo intake (Exhibit A) ----------
-//
-// Client-side only: read the File, downscale to ~1200px long edge, store as a
-// JPEG data URL for both the intake preview and the receipt's Exhibit A card.
-// Never uploaded — the server only ever sees text.
-
-const MAX_EXHIBIT_EDGE = 1200;
-const EXHIBIT_JPEG_QUALITY = 0.82;
-
-function readImageFileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error('read_failed'));
-    reader.onload = () => resolve(reader.result);
-    reader.readAsDataURL(file);
-  });
-}
-
-function downscaleImage(srcDataUrl) {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onerror = () => resolve(srcDataUrl); // fall back to original
-    img.onload = () => {
-      try {
-        const w = img.naturalWidth;
-        const h = img.naturalHeight;
-        if (!w || !h) return resolve(srcDataUrl);
-        const longEdge = Math.max(w, h);
-        const scale = longEdge > MAX_EXHIBIT_EDGE ? (MAX_EXHIBIT_EDGE / longEdge) : 1;
-        const tw = Math.round(w * scale);
-        const th = Math.round(h * scale);
-        const canvas = document.createElement('canvas');
-        canvas.width = tw;
-        canvas.height = th;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, tw, th);
-        const out = canvas.toDataURL('image/jpeg', EXHIBIT_JPEG_QUALITY);
-        resolve(out);
-      } catch (_) {
-        resolve(srcDataUrl);
-      }
-    };
-    img.src = srcDataUrl;
-  });
-}
-
-async function onTabPhotoChange(e) {
-  const input = e.target;
-  const file = input && input.files && input.files[0];
-  if (!file) return;
-  if (!/^image\//.test(file.type)) {
-    input.value = '';
-    return;
-  }
-  try {
-    const raw = await readImageFileToDataUrl(file);
-    const scaled = await downscaleImage(raw);
-    tabPhotoDataUrl = scaled;
-    showTabPhotoPreview(scaled);
-  } catch (_) {
-    clearTabPhoto();
-  }
-  // Reset the input so the same file can be chosen again after clearing.
-  input.value = '';
-}
-
-function showTabPhotoPreview(dataUrl) {
-  const drop = $('exhibit-drop');
-  const inner = $('exhibit-inner');
-  const preview = $('exhibit-preview');
-  const clear = $('exhibit-clear');
-  if (!drop || !preview || !clear) return;
-  preview.src = dataUrl;
-  preview.classList.remove('hidden');
-  clear.classList.remove('hidden');
-  if (inner) inner.classList.add('hidden');
-  drop.classList.add('has-photo');
-}
-
-function clearTabPhoto() {
-  tabPhotoDataUrl = null;
-  const drop = $('exhibit-drop');
-  const inner = $('exhibit-inner');
-  const preview = $('exhibit-preview');
-  const clear = $('exhibit-clear');
-  if (preview) {
-    preview.classList.add('hidden');
-    preview.removeAttribute('src');
-  }
-  if (clear) clear.classList.add('hidden');
-  if (inner) inner.classList.remove('hidden');
-  if (drop) drop.classList.remove('has-photo');
-  const input = $('tab-photo');
-  if (input) input.value = '';
-}
-
-function onExhibitClearClick(e) {
-  // The file input is inside the label, so a click on the "x" would also open
-  // the picker. Swallow it.
-  e.preventDefault();
-  e.stopPropagation();
-  clearTabPhoto();
-}
-
 // ---------- voice intake (Web Speech API) ----------
 //
-// Press-and-hold (or tap-to-toggle) the mic button to dictate. Transcription
-// streams into the textarea. Each utterance pause writes a new line so the
-// "one person per line" intake rule still lines up. Completely optional; the
-// text path always works. No backend calls — the browser handles recognition
-// locally (or via the platform's speech service on Chrome/Edge).
+// Tap the mic to start, tap again to stop. Transcription streams into the
+// textarea. Users can keep talking naturally — the parser will find the names
+// and split multi-person runs into per-person lines at submit time.
+// Completely optional; the text path always works. No backend calls — the
+// browser handles recognition locally (or via the platform's speech service
+// on Chrome/Edge).
 
 const SpeechRec = (typeof window !== 'undefined') &&
   (window.SpeechRecognition || window.webkitSpeechRecognition);
 
 let voice = null;          // active SpeechRecognition instance
 let voiceActive = false;
-let voicePressedAt = 0;    // for distinguishing tap vs hold
+let voiceStarting = false; // true from tap → onstart, for instant UI feedback
 let voiceAppendBase = '';  // textarea value when the current session started
 let voiceFinalChunks = []; // finalized transcript chunks for this session
 
@@ -759,8 +800,6 @@ function normalizeUtterance(s) {
     .replace(/\s+period\.?$/i, '')
     .replace(/\s+/g, ' ')
     .trim();
-  // Lowercase sentence-initial words; speech APIs tend to over-capitalize.
-  // Leave names (first word) as-is so capitalization feels natural.
   return out;
 }
 
@@ -768,14 +807,14 @@ function buildVoiceTextarea(interim) {
   const finals = voiceFinalChunks.map(normalizeUtterance).filter(Boolean);
   const parts = [voiceAppendBase.replace(/\s+$/, '')];
   if (finals.length) {
-    // Separate finals from base and each other with newlines — each utterance
-    // is assumed to be one diner.
-    const joined = finals.join('\n');
-    parts.push(joined);
+    // Join utterances with a single space — the name-aware parser can split
+    // a run-on paragraph into per-person records, so we don't need to force
+    // newlines between utterances.
+    parts.push(finals.join(' '));
   }
   let text = parts.filter(Boolean).join('\n');
   if (interim) {
-    text = (text ? text + '\n' : '') + normalizeUtterance(interim);
+    text = (text ? text + ' ' : '') + normalizeUtterance(interim);
   }
   return text;
 }
@@ -787,15 +826,43 @@ function writeVoiceToTextarea(interim) {
   updateLineCount();
 }
 
+function setMicButtonState(state) {
+  // state: 'idle' | 'starting' | 'listening'
+  const btn = $('mic-btn');
+  if (!btn) return;
+  const lbl = btn.querySelector('.mic-label');
+  btn.classList.remove('starting', 'listening');
+  if (state === 'starting') {
+    btn.classList.add('starting');
+    btn.setAttribute('aria-pressed', 'true');
+    if (lbl) lbl.textContent = 'opening mic\u2026';
+  } else if (state === 'listening') {
+    btn.classList.add('listening');
+    btn.setAttribute('aria-pressed', 'true');
+    if (lbl) lbl.textContent = 'listening\u2026 tap to stop';
+  } else {
+    btn.setAttribute('aria-pressed', 'false');
+    if (lbl) lbl.textContent = 'tap to testify';
+  }
+}
+
 function startVoice() {
   if (!SpeechRec) {
     setMicStatus('this browser can\u2019t listen \u2014 type it instead', 'error');
     return;
   }
-  if (voiceActive) return;
+  if (voiceActive || voiceStarting) return;
+  voiceStarting = true;
+  // Immediate visual feedback — don't wait for onstart (which can take a
+  // beat while the browser prompts for mic permission).
+  setMicButtonState('starting');
+  setMicStatus('opening mic\u2026', 'active');
+
   try {
     voice = new SpeechRec();
   } catch (_) {
+    voiceStarting = false;
+    setMicButtonState('idle');
     setMicStatus('mic unavailable \u2014 type it instead', 'error');
     return;
   }
@@ -810,13 +877,9 @@ function startVoice() {
 
   voice.onstart = () => {
     voiceActive = true;
-    const micBtn = $('mic-btn');
-    if (micBtn) {
-      micBtn.setAttribute('aria-pressed', 'true');
-      const lbl = micBtn.querySelector('.mic-label');
-      if (lbl) lbl.textContent = 'listening\u2026 tap to stop';
-    }
-    setMicStatus('listening\u2026 one person, then pause, then the next', 'active');
+    voiceStarting = false;
+    setMicButtonState('listening');
+    setMicStatus('listening\u2026 say everyone\u2019s names and what they did', 'active');
   };
 
   voice.onresult = (ev) => {
@@ -844,20 +907,16 @@ function startVoice() {
 
   voice.onend = () => {
     voiceActive = false;
-    const micBtn = $('mic-btn');
-    if (micBtn) {
-      micBtn.setAttribute('aria-pressed', 'false');
-      const lbl = micBtn.querySelector('.mic-label');
-      if (lbl) lbl.textContent = 'hold to testify';
-    }
+    voiceStarting = false;
+    setMicButtonState('idle');
     // Finalize: write with no interim so the textarea ends clean.
     writeVoiceToTextarea('');
     if (!voiceFinalChunks.length) {
-      // Leave any existing error message; otherwise clear.
       const el = $('mic-status');
       if (el && !el.classList.contains('error')) setMicStatus('');
     } else {
-      setMicStatus('filed ' + voiceFinalChunks.length + ' line' + (voiceFinalChunks.length === 1 ? '' : 's') + ' into the record', '');
+      const parsedCount = parseLog(($('log') || {}).value || '').length;
+      setMicStatus('filed ' + parsedCount + ' diner' + (parsedCount === 1 ? '' : 's') + ' into the record', '');
     }
     voice = null;
   };
@@ -866,17 +925,25 @@ function startVoice() {
 }
 
 function stopVoice() {
+  if (voiceStarting && voice) {
+    // User tapped again before onstart fired — abort.
+    try { voice.abort && voice.abort(); } catch (_) {}
+    try { voice.stop(); } catch (_) {}
+    voiceStarting = false;
+    setMicButtonState('idle');
+    return;
+  }
   if (!voiceActive || !voice) return;
   try { voice.stop(); } catch (_) {}
 }
 
 function toggleVoice() {
-  if (voiceActive) stopVoice(); else startVoice();
+  if (voiceActive || voiceStarting) stopVoice(); else startVoice();
 }
 
-// Press-and-hold on mobile/desktop: starts on pointerdown, stops on pointerup.
-// Also supports a quick tap to toggle (so mobile users don't have to keep
-// their thumb on it for a whole paragraph).
+// Simple tap-to-toggle. Instant visual feedback on pointerdown so the button
+// never feels laggy (previous press-and-hold semantics felt unresponsive on
+// touch devices where pointerup lagged behind the finger lift).
 function wireMic() {
   const btn = $('mic-btn');
   if (!btn) return;
@@ -888,27 +955,23 @@ function wireMic() {
     return;
   }
 
+  // Use click for toggle. pointerdown adds a pressed visual so touch users
+  // get instant feedback even before click fires.
   btn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    voicePressedAt = Date.now();
-    if (!voiceActive) startVoice();
+    btn.classList.add('tapping');
   });
-  btn.addEventListener('pointerup', (e) => {
-    e.preventDefault();
-    const held = Date.now() - voicePressedAt;
-    // If it was a tap (<300ms), keep listening until the user taps again.
-    // If it was a hold, stop on release.
-    if (held >= 300) stopVoice();
-  });
-  btn.addEventListener('pointerleave', () => {
-    const held = Date.now() - voicePressedAt;
-    if (held >= 300) stopVoice();
-  });
+  const clearTap = () => btn.classList.remove('tapping');
+  btn.addEventListener('pointerup', clearTap);
+  btn.addEventListener('pointerleave', clearTap);
+  btn.addEventListener('pointercancel', clearTap);
+
   btn.addEventListener('click', (e) => {
-    // Handled by pointerdown/up; prevent default to avoid double-toggle on
-    // devices that synthesize a click after touch.
     e.preventDefault();
+    clearTap();
+    toggleVoice();
   });
+
   btn.addEventListener('keydown', (e) => {
     if (e.key === ' ' || e.key === 'Enter') {
       e.preventDefault();
@@ -922,7 +985,7 @@ function share() {
   const url = location.href;
   const total = ($('bill-total-out') && $('bill-total-out').textContent) || '';
   const text = total
-    ? `spitesplit: new total ${total}. see who got charged for what.`
+    ? `spitesplit: total ${total}, spite-redistributed. see who got charged for what.`
     : `spitesplit — split the bill with spite.`;
   if (navigator.share) {
     navigator.share({ title: document.title, text, url }).catch(() => {});
@@ -955,27 +1018,12 @@ document.addEventListener('DOMContentLoaded', () => {
     onReset();
   });
 
-  // Exhibit A — photo of the tab.
-  const photoInput = $('tab-photo');
-  if (photoInput) photoInput.addEventListener('change', onTabPhotoChange);
-  const exhibitClear = $('exhibit-clear');
-  if (exhibitClear) {
-    // Button is inside the <label for="tab-photo">; prevent the label from
-    // also forwarding a click to the hidden file input.
-    exhibitClear.addEventListener('click', onExhibitClearClick);
-    exhibitClear.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
-    exhibitClear.addEventListener('mousedown', (e) => { e.stopPropagation(); });
-  }
-
   // Voice testimony — Web Speech API (client-side, no backend).
   wireMic();
 
   // Deep-link replay: render from fragment without any re-compute / LLM call.
   const frag = decodeFragment();
   if (frag) {
-    // Shared links do NOT carry the photo (too big for a URL fragment). Hide
-    // the exhibit slot for the shared view so it doesn't render empty.
-    tabPhotoDataUrl = null;
     const receipt = receiptFromFragment(frag);
     renderReceipt(receipt);
   }
