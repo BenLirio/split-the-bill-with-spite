@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Split the Bill With Spite — the receipt that keeps score</title>
+  <meta property="og:title" content="Split the Bill With Spite">
+  <meta property="og:description" content="Paste what everyone did at dinner. Get an itemized, spite-adjusted receipt with a named verdict per person. Screenshotable. Petty. Shareable.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+  <script src="feedback.js" defer></script>
+</head>
+<body>
+  <main id="app">
+
+    <!-- INTAKE -->
+    <section id="intake" class="screen">
+      <header class="intake-head">
+        <div class="eyebrow">spite split &middot; v1</div>
+        <h1 class="title">Split the Bill<br><span class="accent">With Spite.</span></h1>
+        <p class="lede">Paste what everyone did at dinner. We&rsquo;ll return an itemized receipt that charges them for it.</p>
+      </header>
+
+      <form id="intake-form" autocomplete="off" novalidate>
+        <label for="bill-total" class="field-label">Bill total (USD)</label>
+        <div class="amount-row">
+          <span class="dollar">$</span>
+          <input id="bill-total" name="bill-total" type="text" inputmode="decimal" value="184.00" maxlength="8" autocomplete="off" spellcheck="false">
+        </div>
+
+        <label for="log" class="field-label">One person per line &mdash; name, then what they did.</label>
+        <textarea id="log" rows="8" maxlength="1600" spellcheck="false"
+          placeholder="Ben ordered the lobster and a second lobster&#10;Sarah forgot her wallet. again.&#10;Kai talked about crypto for 40 minutes&#10;Priya ordered water and judged everyone&#10;Marcus split an appetizer and called it dinner"></textarea>
+        <div class="meta-row">
+          <span id="line-count" class="line-count">0 / 6 people</span>
+          <button type="button" id="sample-btn" class="ghost-btn">use a sample</button>
+        </div>
+
+        <p id="intake-error" class="error hidden" aria-live="polite"></p>
+
+        <button id="submit-btn" type="submit" class="primary-btn">Run the numbers</button>
+        <p class="disclaimer">This is not a real bill splitter. Do not settle actual debts with this.</p>
+      </form>
+    </section>
+
+    <!-- LOADING -->
+    <section id="loading" class="screen hidden" aria-live="polite">
+      <div class="loader">
+        <div class="loader-dots"><span></span><span></span><span></span></div>
+        <p class="loader-copy" id="loader-copy">calibrating pettiness&hellip;</p>
+        <p class="loader-sub">Assessing damages, per diner.</p>
+      </div>
+    </section>
+
+    <!-- RESULT -->
+    <section id="result" class="screen hidden">
+      <article id="receipt" class="receipt">
+        <header class="receipt-head">
+          <div class="brand-row">
+            <div class="brand-mark">SS</div>
+            <div class="brand-text">
+              <p class="brand-name">spitesplit</p>
+              <p class="brand-sub">the receipt that keeps score</p>
+            </div>
+          </div>
+          <h2 class="receipt-title" id="receipt-title">Dinner, itemized</h2>
+          <p class="receipt-meta">
+            <span id="receipt-date">&mdash;</span>
+            <span class="dot">&bull;</span>
+            <span id="receipt-id">&mdash;</span>
+          </p>
+        </header>
+
+        <section id="people" class="people"></section>
+
+        <section class="totals">
+          <div class="total-row subtle">
+            <span>Stated bill</span>
+            <span id="bill-stated" class="mono">$0.00</span>
+          </div>
+          <div class="total-row subtle">
+            <span>Spite adjustments</span>
+            <span id="spite-adj" class="mono">+$0.00</span>
+          </div>
+          <div class="total-row big">
+            <span>New total owed</span>
+            <span id="bill-total-out" class="mono">$0.00</span>
+          </div>
+        </section>
+
+        <footer class="receipt-foot">
+          <p class="foot-line">splits are final. appeals are spiteful.</p>
+          <p class="foot-id" id="foot-id">&mdash;</p>
+        </footer>
+      </article>
+
+      <div id="share" class="cta-row">
+        <button onclick="share()" class="primary-btn">Share the receipt</button>
+        <button id="reset-btn" type="button" class="secondary-btn">Start over</button>
+      </div>
+
+      <p class="outro-cta">Dinner still on the card? <a href="#" id="own-cta">get your own spiteful split &rarr;</a></p>
+    </section>
+
+  </main>
+</body>
+</html>
